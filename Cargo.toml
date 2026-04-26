@@ -1,0 +1,36 @@
+[package]
+name = "jp2lam"
+version = "0.1.0"
+edition = "2024"
+description = "Lean and mean safe JPEG 2000 encoder for document workloads"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "jp2lam"
+path = "src/bin/jp2lam.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+cli          = ["dep:chrono", "dep:image"]
+openjp2-oracle = ["dep:openjp2"]
+profile = []
+counters = []
+
+[dependencies]
+openjp2 = { path = "..", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
+image = { version = "0.25.9", optional = true, default-features = false, features = ["png"] }
+rayon = { version = "1.10" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = true
+lto = "fat"
+codegen-units = 1
