@@ -4,9 +4,6 @@ mod rate;
 mod t1;
 mod t2;
 
-#[cfg(all(test, feature = "openjp2-oracle"))]
-mod tests;
-
 pub(crate) use backend::{NativeBackend, NativeComponentCoefficients};
 
 #[allow(unused_imports)]

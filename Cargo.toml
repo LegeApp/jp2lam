@@ -14,15 +14,18 @@ name = "jp2lam"
 path = "src/bin/jp2lam.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "compare_encodings"
+path = "src/bin/compare_encodings.rs"
+required-features = ["cli"]
+
 [features]
 default = []
 cli          = ["dep:chrono", "dep:image"]
-openjp2-oracle = ["dep:openjp2"]
 profile = []
 counters = []
 
 [dependencies]
-openjp2 = { path = "..", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
 image = { version = "0.25.9", optional = true, default-features = false, features = ["png"] }
 rayon = { version = "1.10" }

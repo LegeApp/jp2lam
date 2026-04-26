@@ -1,6 +1,4 @@
 mod native;
-#[cfg(feature = "openjp2-oracle")]
-mod openjp2;
 
 use super::context::EncodeContext;
 use crate::error::Result;
@@ -11,5 +9,3 @@ pub(crate) trait CodestreamBackend {
 }
 
 pub(crate) use native::NativeBackend;
-#[cfg(feature = "openjp2-oracle")]
-pub(crate) use openjp2::OpenJp2Backend;
