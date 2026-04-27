@@ -1,6 +1,6 @@
 use chrono::Local;
 use image::{DynamicImage, GenericImageView};
-use jp2lam::{encode, ColorSpace, Component, EncodeOptions, Image, OutputFormat, Preset};
+use jp2lam::{encode, ColorSpace, Component, EncodeOptions, Image, OutputFormat};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -23,9 +23,9 @@ fn run() -> Result<(), String> {
     let image = to_jp2lam_image(decoded)?;
 
     let options = EncodeOptions {
-        preset: match image.colorspace {
-            ColorSpace::Gray => Preset::DocumentHigh,
-            _ => Preset::WebHigh,
+        quality: match image.colorspace {
+            ColorSpace::Gray => 85,
+            _ => 62,
         },
         format: OutputFormat::Jp2,
     };

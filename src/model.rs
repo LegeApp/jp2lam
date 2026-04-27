@@ -32,11 +32,11 @@ pub enum OutputFormat {
     J2k,
 }
 
-/// Encoding preset selecting both content type and quality tier.
+/// Named preset for convenience construction of [`EncodeOptions`].
 ///
-/// Pick the preset that matches your source material and the PDF use case.
-/// Quality settings within each preset are tuned for that scenario; you do not
-/// need to set a quality value separately.
+/// Each preset maps to a quality value tuned for that scenario.
+/// Use [`Preset::quality`] to get the underlying `u8` value, or pass a
+/// `quality` directly in [`EncodeOptions`] for full 0–100 control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     /// Scanned book pages destined for a PDF — compressed but fully readable.
@@ -47,6 +47,18 @@ pub enum Preset {
     WebLow,
     /// Web-derived images (screenshots, web-rips) destined for a PDF — crisp.
     WebHigh,
+}
+
+impl Preset {
+    /// Quality value (0–100) associated with this preset.
+    pub fn quality(self) -> u8 {
+        match self {
+            Self::DocumentLow => 30,
+            Self::DocumentHigh => 85,
+            Self::WebLow => 42,
+            Self::WebHigh => 62,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,14 +154,23 @@ fn make_component(data: Vec<i32>, width: u32, height: u32) -> Component {
 
 #[derive(Debug, Clone)]
 pub struct EncodeOptions {
-    pub preset: Preset,
+    /// Quality 0–100. 100 = lossless (reversible 5/3 wavelet, no rate cap).
+    /// Values below 100 use the irreversible 9/7 wavelet with lossy compression.
+    pub quality: u8,
     pub format: OutputFormat,
+}
+
+impl EncodeOptions {
+    /// Convenience constructor from a named preset.
+    pub fn from_preset(preset: Preset, format: OutputFormat) -> Self {
+        Self { quality: preset.quality(), format }
+    }
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
-            preset: Preset::DocumentHigh,
+            quality: Preset::DocumentHigh.quality(),
             format: OutputFormat::Jp2,
         }
     }

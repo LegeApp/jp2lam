@@ -53,7 +53,8 @@ pub(crate) fn build_component_layout(
     });
 
     // ISO/IEC 15444-1 Annex B.5 defines the resolution ladder used here.
-    for (index, &[low, full]) in resolutions.array_windows::<2>().enumerate() {
+    for (index, w) in resolutions.windows(2).enumerate() {
+        let (low, full) = (w[0], w[1]);
         let resolution = (index + 1) as u8;
         subbands.push(make_subband(
             coefficients,

@@ -2,15 +2,15 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use image::DynamicImage;
-use jp2lam::{EncodeOptions, Image, OutputFormat, Preset};
+use jp2lam::{EncodeOptions, Image, OutputFormat};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: compare_encodings <image_path> [output_dir]");
         eprintln!();
-        eprintln!("Encodes the image at multiple JP2 and JPEG settings and writes");
-        eprintln!("one file per variant. JP2 files open in IrfanView, Photoshop, etc.");
+        eprintln!("Encodes the image at multiple quality levels and writes one file per variant.");
+        eprintln!("JP2 files open in IrfanView, Photoshop, etc.");
         std::process::exit(1);
     }
 
@@ -42,28 +42,37 @@ fn main() {
     );
     println!("Output:  {}", out_dir.display());
     println!();
-    println!("{:<32} {:>10} {:>10} {:>10}", "file", "bytes", "vs raw", "vs src");
-    println!("{}", "-".repeat(65));
+    println!("{:<36} {:>10} {:>10} {:>10}", "file", "bytes", "vs raw", "vs src");
+    println!("{}", "-".repeat(69));
 
-    let variants: &[(&str, Encoding)] = &[
-        // -- JP2: all four presets --
-        ("webhigh.jp2",      Encoding::Jp2(Preset::WebHigh)),
-        ("weblow.jp2",       Encoding::Jp2(Preset::WebLow)),
-        ("dochigh.jp2",      Encoding::Jp2(Preset::DocumentHigh)),
-        ("doclow.jp2",       Encoding::Jp2(Preset::DocumentLow)),
+    // Quality sweep: covers the full 0-100 range at meaningful intervals
+    let variants: &[(&str, u8)] = &[
+        ("q20.jp2",  20),
+        ("q30.jp2",  30),
+        ("q42.jp2",  42),
+        ("q55.jp2",  55),
+        ("q62.jp2",  62),
+        ("q70.jp2",  70),
+        ("q75.jp2",  75),
+        ("q80.jp2",  80),
+        ("q85.jp2",  85),
+        ("q90.jp2",  90),
+        ("q95.jp2",  95),
+        ("q99.jp2",  99),
+        ("lossless.jp2", 100),
     ];
 
-    for (suffix, encoding) in variants {
+    for (suffix, quality) in variants {
         let filename = format!("{stem}_{suffix}");
         let out_path = out_dir.join(&filename);
 
-        let bytes = encode(&img, encoding);
+        let bytes = encode_jp2(&img, *quality);
         let ratio_raw = bytes.len() as f64 / rgb_uncompressed as f64 * 100.0;
         let ratio_src = bytes.len() as f64 / src_bytes as f64 * 100.0;
         fs::write(&out_path, &bytes).expect("failed to write output");
 
         println!(
-            "{:<32} {:>10} {:>9.1}% {:>9.1}%",
+            "{:<36} {:>10} {:>9.1}% {:>9.1}%",
             filename,
             fmt(bytes.len()),
             ratio_raw,
@@ -72,24 +81,16 @@ fn main() {
     }
 }
 
-enum Encoding {
-    Jp2(Preset),
-}
-
-fn encode(img: &DynamicImage, encoding: &Encoding) -> Vec<u8> {
-    match encoding {
-        Encoding::Jp2(preset) => {
-            let rgb = img.to_rgb8();
-            let (w, h) = rgb.dimensions();
-            let jp2_img = Image::from_rgb_bytes(w, h, rgb.as_raw())
-                .expect("failed to build jp2lam Image");
-            jp2lam::encode(
-                &jp2_img,
-                &EncodeOptions { preset: *preset, format: OutputFormat::Jp2 },
-            )
-            .expect("jp2lam encode failed")
-        }
-    }
+fn encode_jp2(img: &DynamicImage, quality: u8) -> Vec<u8> {
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let jp2_img = Image::from_rgb_bytes(w, h, rgb.as_raw())
+        .expect("failed to build jp2lam Image");
+    jp2lam::encode(
+        &jp2_img,
+        &EncodeOptions { quality, format: OutputFormat::Jp2 },
+    )
+    .expect("jp2lam encode failed")
 }
 
 fn fmt(n: usize) -> String {

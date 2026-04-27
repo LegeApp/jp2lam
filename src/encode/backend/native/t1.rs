@@ -584,7 +584,7 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
             Vec::new()
         };
 
-        let pass = passes.push_mut(NativeEncodedTier1Pass {
+        passes.push(NativeEncodedTier1Pass {
             kind,
             bitplane,
             pass_index: i as u16,
@@ -596,10 +596,9 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
             significant_before: sb,
             length,
             cumulative_length: cumulative,
-            distortion_hint: 0,
+            distortion_hint: distortion_hint(bitplane, ns, block.max_magnitude),
             bytes,
         });
-        pass.distortion_hint = distortion_hint(bitplane, ns, block.max_magnitude);
         
 #[cfg(feature = "counters")]
         {
@@ -670,7 +669,7 @@ fn append_pass(
         counters::TOTAL_PASS_BYTES.fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
     }
     
-    let pass = passes.push_mut(NativeEncodedTier1Pass {
+    passes.push(NativeEncodedTier1Pass {
         kind,
         bitplane,
         pass_index,
@@ -682,10 +681,9 @@ fn append_pass(
         significant_before,
         length,
         cumulative_length: *cumulative_length,
-        distortion_hint: 0,
+        distortion_hint: distortion_hint(bitplane, newly_significant, block.max_magnitude),
         bytes,
     });
-    pass.distortion_hint = distortion_hint(bitplane, newly_significant, block.max_magnitude);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
