@@ -4,6 +4,7 @@
 //! optimization based on human visual perception.
 
 pub mod contrast_mask;
+pub mod taubman_masking;
 
 pub use contrast_mask::{
     average_mask_for_source_rect, build_contrast_mask_map_from_luma_u8,

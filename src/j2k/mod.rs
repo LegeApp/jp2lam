@@ -51,7 +51,7 @@ mod tests {
         let plan = EncodingPlan::build(
             &image,
             &EncodeOptions {
-                preset: Preset::DocumentHigh,
+                quality: Preset::DocumentHigh.quality(),
                 format: OutputFormat::J2k,
             },
         )
@@ -83,7 +83,7 @@ mod tests {
         let plan = EncodingPlan::build(
             &image,
             &EncodeOptions {
-                preset: Preset::DocumentHigh,
+                quality: Preset::DocumentHigh.quality(),
                 format: OutputFormat::J2k,
             },
         )

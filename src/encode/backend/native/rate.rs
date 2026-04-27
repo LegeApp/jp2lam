@@ -11,6 +11,7 @@ use crate::dwt::pcrd::{
     build_hull_curve, estimate_pass_distortion_delta_with_model, BandKind, CodeBlockPcrdCurve,
     DistortionModel, PassDistortionContext, PassKind, PcrdError, RawPassRecord,
 };
+use crate::perceptual::taubman_masking::TaubmanMaskMap;
 use crate::plan::{BandOrientation, SubbandQuant};
 
 use super::t1::{NativeEncodedTier1CodeBlock, NativeEncodedTier1Layout};
@@ -24,7 +25,13 @@ use super::t1::{NativeEncodedTier1CodeBlock, NativeEncodedTier1Layout};
 /// without affecting the marginal slope between consecutive included passes.
 const HEADER_OVERHEAD_BYTES: u32 = 2;
 
-const ACTIVE_DISTORTION_MODEL: DistortionModel = DistortionModel::PassKindAware;
+fn active_distortion_model(quality: u8, has_taubman: bool) -> DistortionModel {
+    if has_taubman && quality < 30 {
+        DistortionModel::Taubman2000
+    } else {
+        DistortionModel::PassKindAware
+    }
+}
 
 /// Build pruned PCRD hull curves for every code-block in a Tier-1 layout.
 ///
@@ -34,6 +41,8 @@ const ACTIVE_DISTORTION_MODEL: DistortionModel = DistortionModel::PassKindAware;
 /// coefficient-domain magnitudes.
 /// `quality` enables quality-dependent distortion weighting.
 /// `contrast_mask` provides perceptual masking weights based on local texture.
+/// `taubman_weights` provides pre-computed Taubman §VI per-block masking weights
+/// in band-major, block-major order (same traversal as this function).
 pub(crate) fn curves_from_tier1_layout(
     layout: &NativeEncodedTier1Layout,
     num_resolutions: u8,
@@ -41,9 +50,11 @@ pub(crate) fn curves_from_tier1_layout(
     precision: u32,
     quality: u8,
     contrast_mask: Option<&crate::perceptual::ContrastMaskMap>,
+    taubman_weights: Option<&[f64]>,
 ) -> Result<Vec<CodeBlockPcrdCurve>, PcrdError> {
     let mut curves = Vec::new();
     let mut next_id = 0usize;
+    let model = active_distortion_model(quality, taubman_weights.is_some());
 
     for band in &layout.bands {
         let weight = subband_weight_for(num_resolutions, band.resolution, band.band);
@@ -61,6 +72,10 @@ pub(crate) fn curves_from_tier1_layout(
                 band.band,
                 num_resolutions,
             );
+            let taubman_w = taubman_weights
+                .and_then(|ws| ws.get(next_id))
+                .copied()
+                .unwrap_or(1.0);
             let raws = raw_records_for_block(
                 block,
                 weight,
@@ -69,6 +84,8 @@ pub(crate) fn curves_from_tier1_layout(
                 band.resolution,
                 quality,
                 contrast_weight,
+                taubman_w,
+                model,
             );
             curves.push(build_hull_curve(next_id, &raws)?);
             next_id += 1;
@@ -76,6 +93,47 @@ pub(crate) fn curves_from_tier1_layout(
     }
 
     Ok(curves)
+}
+
+/// Compute per-block Taubman §VI masking weights for all blocks in a layout.
+///
+/// Takes the pre-quantization 9/7 DWT coefficients (f32, row-major in the full
+/// image array at `dwt_width` stride) and computes the masking weight for each
+/// code block in band-major, block-major order — the same traversal used by
+/// `curves_from_tier1_layout`.
+///
+/// Each weight is the Taubman §VI block_masking_multiplier ∈ (0, 1]:
+/// 1.0 = flat (maximum perceptual cost), ~0 = highly textured (masking hides errors).
+pub(crate) fn build_taubman_weights_for_layout(
+    layout: &NativeEncodedTier1Layout,
+    dwt_f32: &[f32],
+    dwt_width: usize,
+    num_resolutions: u8,
+) -> Vec<f64> {
+    let mut weights = Vec::new();
+    for band in &layout.bands {
+        let level = match band.band {
+            BandOrientation::Ll => num_resolutions.saturating_sub(1),
+            _ => num_resolutions.saturating_sub(1).saturating_sub(band.resolution),
+        };
+        let synthesis_norm = get_norm_97(u32::from(level), band.band);
+
+        for block in &band.blocks {
+            let bw = block.x1 - block.x0;
+            let bh = block.y1 - block.y0;
+            // Extract block coefficients from the full interleaved DWT array
+            let mut coeffs = Vec::with_capacity(bw * bh);
+            for row in block.y0..block.y1 {
+                let row_start = row * dwt_width + block.x0;
+                for &v in &dwt_f32[row_start..row_start + bw] {
+                    coeffs.push(v as f64);
+                }
+            }
+            let mask = TaubmanMaskMap::from_subband(&coeffs, bw, bh, synthesis_norm);
+            weights.push(mask.block_masking_multiplier(0, 0, bw, bh));
+        }
+    }
+    weights
 }
 
 fn raw_records_for_block(
@@ -86,6 +144,8 @@ fn raw_records_for_block(
     resolution: u8,
     quality: u8,
     contrast_visibility_weight: f64,
+    taubman_masking_weight: f64,
+    model: DistortionModel,
 ) -> Vec<RawPassRecord> {
     use crate::encode::backend::native::t1::NativeTier1PassKind;
 
@@ -114,9 +174,9 @@ fn raw_records_for_block(
             quality,
             block_class: block.block_class,
             contrast_visibility_weight,
+            taubman_masking_weight,
         };
-        let distortion_delta =
-            estimate_pass_distortion_delta_with_model(&ctx, ACTIVE_DISTORTION_MODEL);
+        let distortion_delta = estimate_pass_distortion_delta_with_model(&ctx, model);
 
         // Offset cumulative by the header overhead so the "omit → first pass"
         // slope accounts for the per-block packet signaling cost. Each subsequent
@@ -233,7 +293,7 @@ mod tests {
             colorspace: ColorSpace::Gray,
         };
         let options = EncodeOptions {
-            preset: Preset::DocumentHigh,
+            quality: Preset::DocumentHigh.quality(),
             format: OutputFormat::J2k,
         };
         (image, options)
@@ -256,6 +316,7 @@ mod tests {
             precision,
             context.plan.quality,
             None, // No contrast masking in test
+            None, // No taubman masking in test
         )
         .expect("curves");
         assert!(!curves.is_empty(), "expected at least one block");

@@ -1,44 +1,10 @@
 use crate::dwt::norms::{irreversible_expounded_quant, reversible_exponent};
-use crate::model::{ColorSpace, Image, Preset};
+use crate::model::{ColorSpace, Image};
 
 use super::{
-    BandOrientation, ComponentPlan, EncodeLane, QuantizationStyle, SubbandQuant, WaveletTransform,
+    BandOrientation, CodeBlockSize, ComponentPlan, EncodeLane, QuantizationStyle, SubbandQuant,
+    WaveletTransform,
 };
-
-/// Parameters derived from a [`Preset`].
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PresetParams {
-    pub quality: u8,
-    pub transform: WaveletTransform,
-    pub use_mct: bool,
-}
-
-impl Preset {
-    pub(super) fn params(self) -> PresetParams {
-        match self {
-            Preset::DocumentLow => PresetParams {
-                quality: 30,
-                transform: WaveletTransform::Irreversible97,
-                use_mct: true,
-            },
-            Preset::DocumentHigh => PresetParams {
-                quality: 85,
-                transform: WaveletTransform::Irreversible97,
-                use_mct: true,
-            },
-            Preset::WebLow => PresetParams {
-                quality: 42,
-                transform: WaveletTransform::Irreversible97,
-                use_mct: true,
-            },
-            Preset::WebHigh => PresetParams {
-                quality: 62,
-                transform: WaveletTransform::Irreversible97,
-                use_mct: true,
-            },
-        }
-    }
-}
 
 pub(super) fn derive_lane(color_space: ColorSpace, is_lossless: bool) -> EncodeLane {
     match (color_space.encoding_domain(), is_lossless) {
@@ -135,7 +101,7 @@ fn scale_one_quant(sq: &SubbandQuant, scale: f64) -> SubbandQuant {
     }
 }
 
-pub(super) fn max_target_decompositions(color_space: ColorSpace, preset: Preset) -> u32 {
+pub(super) fn max_target_decompositions(color_space: ColorSpace) -> u32 {
     match color_space.encoding_domain() {
         ColorSpace::Gray => 5,
         ColorSpace::Srgb => 6,
@@ -143,15 +109,8 @@ pub(super) fn max_target_decompositions(color_space: ColorSpace, preset: Preset)
     }
 }
 
-pub(super) fn transform_for(preset: Preset) -> WaveletTransform {
-    preset.params().transform
-}
-
-pub(super) fn use_mct(color_space: ColorSpace, preset: Preset) -> bool {
-    match color_space.encoding_domain() {
-        ColorSpace::Gray => false,
-        _ => preset.params().use_mct,
-    }
+pub(super) fn use_mct(color_space: ColorSpace) -> bool {
+    matches!(color_space.encoding_domain(), ColorSpace::Srgb)
 }
 
 /// Maximum useful decomposition levels for an image of the given dimensions.
@@ -174,23 +133,29 @@ pub(super) fn max_decompositions(width: u32, height: u32) -> u32 {
     (1 + (u32::BITS - 1) - ratio.leading_zeros()).min(6)
 }
 
-pub(super) fn tcp_rate_from_quality(quality: u8, preset: Preset) -> f32 {
+/// Convert quality 0–99 to a JPEG 2000 TCP compression rate.
+///
+/// Higher rate = more compression (smaller file). quality=0 → ~42:1,
+/// quality=99 → ~0.35:1 (near-lossless). quality=100 must be handled
+/// upstream (lossless path: rate target = None).
+pub(super) fn tcp_rate_from_quality(quality: u8) -> f32 {
     let q = quality.min(99) as f32;
     let t = (q + 0.5) / 99.5;
     const RATE_HIGH_COMPRESSION: f32 = 42.0;
     const RATE_NEAR_LOSSLESS: f32 = 0.35;
-    let mut rate = RATE_HIGH_COMPRESSION * (1.0 - t) + RATE_NEAR_LOSSLESS * t;
-    rate *= preset_rate_multiplier(preset);
-    rate.min(RATE_HIGH_COMPRESSION * 1.35)
-        .max(RATE_NEAR_LOSSLESS)
+    let rate = RATE_HIGH_COMPRESSION * (1.0 - t) + RATE_NEAR_LOSSLESS * t;
+    rate.min(RATE_HIGH_COMPRESSION * 1.35).max(RATE_NEAR_LOSSLESS)
 }
 
-fn preset_rate_multiplier(preset: Preset) -> f32 {
-    match preset {
-        Preset::DocumentLow => 0.86,
-        Preset::DocumentHigh => 0.98,
-        Preset::WebLow => 0.88,
-        Preset::WebHigh => 1.0,
+/// Derive code-block size from quality.
+///
+/// 32×32 below quality 30 (≈ ≤0.25 bpp for 8-bit) gives finer PCRD granularity
+/// and aligns the 8×8 masking-cell grid (4×4 cells per block) per [T2000] §VI.
+pub(super) fn derive_code_block_size(quality: u8) -> CodeBlockSize {
+    if quality < 30 {
+        CodeBlockSize { width: 32, height: 32 }
+    } else {
+        CodeBlockSize { width: 64, height: 64 }
     }
 }
 

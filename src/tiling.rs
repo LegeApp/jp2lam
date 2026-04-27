@@ -386,7 +386,7 @@ mod tests {
         };
         EncodingPlan::build(
             &image,
-            &EncodeOptions { preset: Preset::DocumentHigh, format: OutputFormat::J2k },
+            &EncodeOptions { quality: Preset::DocumentHigh.quality(), format: OutputFormat::J2k },
         )
         .unwrap()
     }

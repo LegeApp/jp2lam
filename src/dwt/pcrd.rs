@@ -611,16 +611,27 @@ pub struct PassDistortionContext {
     /// Lower = texture can hide errors = spend fewer bits.
     /// Higher = smooth/edges need quality = spend more bits.
     pub contrast_visibility_weight: f64,
+    /// Taubman §VI subband masking weight (0.0–1.0).
+    /// 1.0 = flat region (maximum perceptual cost per bit).
+    /// ~0.0 = highly textured (masking hides errors, fewer bits needed).
+    /// Only used when DistortionModel::Taubman2000 is active; defaults to 1.0.
+    pub taubman_masking_weight: f64,
 }
 
 /// Distortion model selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DistortionModel {
-    /// Quant-aware energy, 0.004 MR factor, flat band bias.
+    /// Quant-aware energy, 0.25 MR factor, flat band bias.
     BaselineAlpha,
     /// Separate SP/MR/CL weights + subband orientation bias.
     #[default]
     PassKindAware,
+    /// Taubman 2000 §VI subband-domain visual masking.
+    ///
+    /// Requires `PassDistortionContext::taubman_masking_weight` to be populated
+    /// from `TaubmanMaskMap::block_masking_multiplier`. Falls back to
+    /// `PassKindAware` behavior when the weight is 1.0 (flat/unmasked).
+    Taubman2000,
 }
 
 /// Dispatch to the selected distortion model.
@@ -631,17 +642,18 @@ pub fn estimate_pass_distortion_delta_with_model(
     match model {
         DistortionModel::BaselineAlpha => estimate_pass_distortion_delta_baseline(ctx),
         DistortionModel::PassKindAware => estimate_pass_distortion_delta_pass_kind_aware(ctx),
+        DistortionModel::Taubman2000 => estimate_pass_distortion_delta_taubman2000(ctx),
     }
 }
 
 /// Baseline model — identical to the original `estimate_pass_distortion_delta`.
 ///
-/// Energy = (Δ·2^b)², MR factor = 0.004.
+/// Energy = (Δ·2^b)². MR factor = 0.25 from E[(±Δ_b/2)²] = energy/4 per unknown bit.
 pub fn estimate_pass_distortion_delta_baseline(ctx: &PassDistortionContext) -> f64 {
     let plane_weight = (1u64 << ctx.bitplane.min(30)) as f64 * ctx.quant_step;
     let energy = plane_weight * plane_weight;
     let sig_term = ctx.newly_significant as f64 * energy;
-    let ref_term = ctx.refinement_samples as f64 * energy * 0.004;
+    let ref_term = ctx.refinement_samples as f64 * energy * 0.25;
     ctx.subband_weight * (sig_term + ref_term)
 }
 
@@ -651,16 +663,16 @@ pub fn estimate_pass_distortion_delta_baseline(ctx: &PassDistortionContext) -> f
 /// - **Band bias** (quality-dependent): Preserves LL at low quality, balanced at high quality
 /// - **Block classification**: Preserves flat areas, allows compression in textured areas
 ///
-/// SP gets the full energy allocation; MR is weighted at 0.004 (same threshold
-/// as baseline); CL uses a slightly reduced weight (0.85) because it encodes
-/// the residual context bits rather than the raw coefficient value.
+/// SP gets the full energy allocation; MR uses 0.25 (= energy/4, the expected
+/// squared error from one unknown refinement bit ±Δ_b/2); CL uses 0.85 because
+/// it encodes residual context bits after the significance pass.
 pub fn estimate_pass_distortion_delta_pass_kind_aware(ctx: &PassDistortionContext) -> f64 {
     let plane_weight = (1u64 << ctx.bitplane.min(30)) as f64 * ctx.quant_step;
     let energy = plane_weight * plane_weight;
 
     let pass_contribution = match ctx.pass_kind {
         PassKind::SignificancePropagation => ctx.newly_significant as f64 * energy,
-        PassKind::MagnitudeRefinement => ctx.refinement_samples as f64 * energy * 0.004,
+        PassKind::MagnitudeRefinement => ctx.refinement_samples as f64 * energy * 0.25,
         PassKind::Cleanup => ctx.newly_significant as f64 * energy * 0.85,
     };
 
@@ -681,6 +693,28 @@ pub fn estimate_pass_distortion_delta_pass_kind_aware(ctx: &PassDistortionContex
         ctx.block_class,
         ctx.quality,
     )
+}
+
+/// Taubman 2000 §VI perceptual masking model.
+///
+/// Replaces the image-domain contrast masker with a subband-domain masker.
+/// The distortion weight per block is scaled by `taubman_masking_weight`,
+/// which must be pre-computed from `TaubmanMaskMap::block_masking_multiplier`.
+///
+/// Formula: ΔD_vis = subband_weight · taubman_masking_weight · pass_contribution
+/// where `taubman_masking_weight` ∈ (0,1] encodes mean(1/(ν²+f²)) normalized
+/// to 1.0 at the flat-cell floor ([T2000] §VI eqs. 4–5).
+pub fn estimate_pass_distortion_delta_taubman2000(ctx: &PassDistortionContext) -> f64 {
+    let plane_weight = (1u64 << ctx.bitplane.min(30)) as f64 * ctx.quant_step;
+    let energy = plane_weight * plane_weight;
+
+    let pass_contribution = match ctx.pass_kind {
+        PassKind::SignificancePropagation => ctx.newly_significant as f64 * energy,
+        PassKind::MagnitudeRefinement => ctx.refinement_samples as f64 * energy * 0.25,
+        PassKind::Cleanup => ctx.newly_significant as f64 * energy * 0.85,
+    };
+
+    ctx.subband_weight * ctx.taubman_masking_weight * pass_contribution
 }
 
 /// Subband orientation bias for the pass-kind-aware model.
@@ -789,14 +823,20 @@ pub fn explain_pass_distortion(
     let energy_per_sample = plane_weight * plane_weight;
     let band_bias = match model {
         DistortionModel::PassKindAware => band_distortion_bias(ctx.band_kind, ctx.quality),
-        DistortionModel::BaselineAlpha => 1.0,
+        DistortionModel::BaselineAlpha | DistortionModel::Taubman2000 => 1.0,
     };
     let effective_samples = match (model, ctx.pass_kind) {
-        (_, PassKind::MagnitudeRefinement) => ctx.refinement_samples as f64 * 0.004,
-        (DistortionModel::PassKindAware, PassKind::Cleanup) => ctx.newly_significant as f64 * 0.85,
+        (_, PassKind::MagnitudeRefinement) => ctx.refinement_samples as f64 * 0.25,
+        (DistortionModel::PassKindAware | DistortionModel::Taubman2000, PassKind::Cleanup) => {
+            ctx.newly_significant as f64 * 0.85
+        }
         _ => ctx.newly_significant as f64,
     };
-    let total = ctx.subband_weight * band_bias * effective_samples * energy_per_sample;
+    let masking = match model {
+        DistortionModel::Taubman2000 => ctx.taubman_masking_weight,
+        _ => 1.0,
+    };
+    let total = ctx.subband_weight * band_bias * masking * effective_samples * energy_per_sample;
     PassDistortionExplanation {
         model,
         energy_per_sample,
@@ -1147,6 +1187,7 @@ mod tests {
             quality: 75,
             block_class: crate::profile::BlockClass::TexturePhoto,
             contrast_visibility_weight: 1.0,
+            taubman_masking_weight: 1.0,
         };
         let ctx_high = PassDistortionContext { bitplane: 5, ..ctx_low };
         let low = estimate_pass_distortion_delta_with_model(&ctx_low, DistortionModel::PassKindAware);
@@ -1303,6 +1344,7 @@ mod tests {
             quality: 75,
             block_class: crate::profile::BlockClass::TexturePhoto,
             contrast_visibility_weight: 1.0,
+            taubman_masking_weight: 1.0,
         };
         let baseline = estimate_pass_distortion_delta_baseline(&ctx);
         let pka = estimate_pass_distortion_delta_pass_kind_aware(&ctx);
@@ -1328,6 +1370,7 @@ mod tests {
             quality: 75,
             block_class: crate::profile::BlockClass::TexturePhoto,
             contrast_visibility_weight: 1.0,
+            taubman_masking_weight: 1.0,
         };
         for model in [DistortionModel::BaselineAlpha, DistortionModel::PassKindAware] {
             let direct = estimate_pass_distortion_delta_with_model(&ctx, model);

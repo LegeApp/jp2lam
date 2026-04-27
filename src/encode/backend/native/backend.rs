@@ -84,6 +84,24 @@ impl NativeBackend {
         })
     }
 
+    /// Compute the 9/7 DWT coefficients (f32) WITHOUT quantizing them.
+    ///
+    /// Used by the Taubman masker to get pre-quantization coefficient magnitudes.
+    /// The coefficients are in the same spatial layout as `NativeComponentCoefficients.data`
+    /// (interleaved subbands in the full image array, row-major).
+    pub(crate) fn compute_dwt_97_f32(
+        &self,
+        context: &EncodeContext<'_>,
+        component_index: usize,
+    ) -> Result<Vec<f32>> {
+        let mut data = irreversible_input_component(context, component_index)?;
+        let width = context.plan.width as usize;
+        let height = context.plan.height as usize;
+        let levels = context.plan.decomposition_levels;
+        forward_97_2d_in_place(&mut data, width, height, levels)?;
+        Ok(data)
+    }
+
     pub(super) fn supports_lane(&self, context: &EncodeContext<'_>) -> bool {
         matches!(
             context.plan.lane,
@@ -437,7 +455,8 @@ fn quantize_97_coefficients(
     )?;
     quantize_subband_rect(data, &mut out, width, 0, 0, ll.0, ll.1, ll_step);
 
-    for (index, &[low, full]) in resolutions.array_windows::<2>().enumerate() {
+    for (index, w) in resolutions.windows(2).enumerate() {
+        let (low, full) = (w[0], w[1]);
         let resolution = (index + 1) as u8;
         let hl_step = subband_quant_step(
             precision,
@@ -528,14 +547,30 @@ fn apply_pcrd_selection(
         return Ok(());
     }
 
-    // Calculate pixel count for resolution-aware lambda scaling
     let pixel_count = context.image.width * context.image.height;
-
-    // Build contrast mask map from luma component for perceptual masking
     let contrast_mask = build_luma_contrast_mask(context);
 
-    // Apply quality-based PCRD selection
-    for layout in layouts.iter_mut() {
+    // For low-bitrate (quality < 30) irreversible encodes, compute Taubman §VI
+    // masking weights from the pre-quantization DWT coefficients.
+    let use_taubman = quality < 30
+        && matches!(context.plan.transform, crate::plan::WaveletTransform::Irreversible97);
+
+    let backend = NativeBackend;
+    for (component_index, layout) in layouts.iter_mut().enumerate() {
+        let taubman_weights: Option<Vec<f64>> = if use_taubman {
+            match backend.compute_dwt_97_f32(context, component_index) {
+                Ok(dwt_f32) => Some(rate::build_taubman_weights_for_layout(
+                    layout,
+                    &dwt_f32,
+                    context.plan.width as usize,
+                    context.plan.num_resolutions,
+                )),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         let precision = context.plan.components.first().map(|c| c.precision).unwrap_or(8);
         let curves = rate::curves_from_tier1_layout(
             layout,
@@ -544,6 +579,7 @@ fn apply_pcrd_selection(
             precision,
             quality,
             contrast_mask.as_ref(),
+            taubman_weights.as_deref(),
         )
         .map_err(|err| Jp2LamError::EncodeFailed(err.to_string()))?;
 

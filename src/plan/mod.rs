@@ -2,11 +2,11 @@ mod derive;
 mod validate;
 
 use crate::error::Result;
-use crate::model::{ColorSpace, EncodeOptions, Image, OutputFormat, Preset};
+use crate::model::{ColorSpace, EncodeOptions, Image, OutputFormat};
 use derive::{
-    apply_quality_step_scaling, derive_component_plans, derive_lane, derive_subband_quants,
-    max_decompositions, max_target_decompositions, tcp_rate_from_quality, transform_for, use_mct,
-    PresetParams,
+    apply_quality_step_scaling, derive_code_block_size, derive_component_plans, derive_lane,
+    derive_subband_quants, max_decompositions, max_target_decompositions, tcp_rate_from_quality,
+    use_mct,
 };
 use validate::validate_image;
 
@@ -96,7 +96,6 @@ pub(crate) struct EncodingPlan {
     pub component_count: u16,
     pub colorspace: ColorSpace,
     pub output_format: OutputFormat,
-    pub preset: Preset,
     pub quality: u8,
     pub lane: EncodeLane,
     pub progression_order: ProgressionOrder,
@@ -107,7 +106,7 @@ pub(crate) struct EncodingPlan {
     pub num_resolutions: u8,
     pub code_block_size: CodeBlockSize,
     pub guard_bits: u8,
-    pub layers: [QualityLayer; 1],
+    pub layers: Vec<QualityLayer>,
     pub tile: TilePlan,
     pub components: Vec<ComponentPlan>,
     pub subband_quants: Vec<SubbandQuant>,
@@ -118,21 +117,25 @@ impl EncodingPlan {
         validate_image(image)?;
 
         let encoding_colorspace = image.colorspace.encoding_domain();
-        let preset_params = options.preset.params();
-        let quality = preset_params.quality;
-        let decomposition_cap = max_target_decompositions(encoding_colorspace, options.preset);
+        let quality = options.quality;
+        let is_lossless = quality >= 100;
+        let transform = if is_lossless {
+            WaveletTransform::Reversible53
+        } else {
+            WaveletTransform::Irreversible97
+        };
+        let decomposition_cap = max_target_decompositions(encoding_colorspace);
         let decomposition_levels =
             max_decompositions(image.width, image.height).min(decomposition_cap) as u8;
-        let use_mct = use_mct(encoding_colorspace, options.preset);
-        let transform = transform_for(options.preset);
-        let target_rate = if quality >= 100 {
+        let use_mct = use_mct(encoding_colorspace);
+        let target_rate = if is_lossless {
             None
         } else {
-            Some(tcp_rate_from_quality(quality, options.preset))
+            Some(tcp_rate_from_quality(quality))
         };
         let lane = derive_lane(
             encoding_colorspace,
-            target_rate.is_none() && matches!(transform, WaveletTransform::Reversible53),
+            target_rate.is_none() && is_lossless,
         );
         let components = derive_component_plans(image);
         let (quantization_style, mut subband_quants) = derive_subband_quants(
@@ -152,7 +155,6 @@ impl EncodingPlan {
             component_count: image.components.len() as u16,
             colorspace: encoding_colorspace,
             output_format: options.format,
-            preset: options.preset,
             quality,
             lane,
             progression_order: ProgressionOrder::Lrcp,
@@ -161,12 +163,9 @@ impl EncodingPlan {
             use_mct,
             decomposition_levels,
             num_resolutions: decomposition_levels.saturating_add(1),
-            code_block_size: CodeBlockSize {
-                width: 64,
-                height: 64,
-            },
+            code_block_size: derive_code_block_size(quality),
             guard_bits: 2,
-            layers: [QualityLayer { target_rate }],
+            layers: vec![QualityLayer { target_rate }],
             tile: TilePlan {
                 index: 0,
                 width: image.width,
@@ -186,14 +185,14 @@ impl EncodingPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Component, EncodeOptions, Image, OutputFormat, Preset};
+    use crate::model::{Component, EncodeOptions, Image, OutputFormat};
 
     #[test]
-    fn rate_is_monotonic_for_web_low_preset() {
+    fn rate_is_monotonic_across_quality_range() {
         let mut prev = f32::INFINITY;
         for q in (0u8..100).step_by(5) {
-            let rate = tcp_rate_from_quality(q, Preset::WebLow);
-            assert!(rate <= prev);
+            let rate = tcp_rate_from_quality(q);
+            assert!(rate <= prev, "rate not monotonic at q={q}: {rate} > {prev}");
             prev = rate;
         }
     }
@@ -228,7 +227,7 @@ mod tests {
         let plan = EncodingPlan::build(
             &image,
             &EncodeOptions {
-                preset: Preset::DocumentHigh,
+                quality: 85,
                 format: OutputFormat::Jp2,
             },
         )
@@ -264,7 +263,7 @@ mod tests {
             let plan = EncodingPlan::build(
                 &image,
                 &EncodeOptions {
-                    preset: Preset::DocumentHigh,
+                    quality: 85,
                     format: OutputFormat::J2k,
                 },
             )
@@ -334,7 +333,7 @@ mod tests {
         let plan = EncodingPlan::build(
             &image,
             &EncodeOptions {
-                preset: Preset::WebLow,
+                quality: 42,
                 format: OutputFormat::J2k,
             },
         )
