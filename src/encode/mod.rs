@@ -109,3 +109,19 @@ pub fn encode_to_writer<W: Write>(
         .write_all(&bytes)
         .map_err(|err| Jp2LamError::EncodeFailed(err.to_string()))
 }
+
+/// Encode and compute an internal PSNR estimate in one call.
+///
+/// The PSNR is computed by simulating the decoder: re-running the encoder
+/// pipeline to get PCRD-truncated coefficients, applying inverse quantization
+/// and inverse DWT, and comparing against the original pixels.
+///
+/// Returns `(encoded_bytes, psnr_db)`. For lossless encodes (quality == 100)
+/// `psnr_db` is `f64::INFINITY`.
+pub fn encode_with_psnr(image: &Image, options: &EncodeOptions) -> Result<(Vec<u8>, f64)> {
+    let bytes = encode(image, options)?;
+    let context = EncodeContext::new(image, options)?;
+    let native = NativeBackend;
+    let psnr = native.compute_psnr(&context)?;
+    Ok((bytes, psnr))
+}

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use image::DynamicImage;
-use jp2lam::{EncodeOptions, Image, OutputFormat};
+use jp2lam::{EncodeOptions, Image, OutputFormat, encode_with_psnr};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -32,6 +32,8 @@ fn main() {
     let (width, height) = (img.width(), img.height());
     let rgb_uncompressed = (width as usize) * (height as usize) * 3;
 
+    let n_pixels = (width * height) as usize;
+
     println!(
         "Source:  {} ({}x{}, {} bytes on disk, {} bytes raw RGB)",
         src_path.display(),
@@ -42,8 +44,8 @@ fn main() {
     );
     println!("Output:  {}", out_dir.display());
     println!();
-    println!("{:<36} {:>10} {:>10} {:>10}", "file", "bytes", "vs raw", "vs src");
-    println!("{}", "-".repeat(69));
+    println!("{:<36} {:>10} {:>7} {:>8}", "file", "bytes", "bpp", "PSNR dB");
+    println!("{}", "-".repeat(66));
 
     // Quality sweep: covers the full 0-100 range at meaningful intervals
     let variants: &[(&str, u8)] = &[
@@ -66,27 +68,32 @@ fn main() {
         let filename = format!("{stem}_{suffix}");
         let out_path = out_dir.join(&filename);
 
-        let bytes = encode_jp2(&img, *quality);
-        let ratio_raw = bytes.len() as f64 / rgb_uncompressed as f64 * 100.0;
-        let ratio_src = bytes.len() as f64 / src_bytes as f64 * 100.0;
+        let (bytes, psnr) = encode_jp2_with_psnr(&img, *quality);
+        let bpp = bytes.len() as f64 * 8.0 / n_pixels as f64;
         fs::write(&out_path, &bytes).expect("failed to write output");
 
+        let psnr_str = if psnr.is_infinite() {
+            "lossless".to_string()
+        } else {
+            format!("{psnr:.2}")
+        };
+
         println!(
-            "{:<36} {:>10} {:>9.1}% {:>9.1}%",
+            "{:<36} {:>10} {:>7.3} {:>8}",
             filename,
             fmt(bytes.len()),
-            ratio_raw,
-            ratio_src,
+            bpp,
+            psnr_str,
         );
     }
 }
 
-fn encode_jp2(img: &DynamicImage, quality: u8) -> Vec<u8> {
+fn encode_jp2_with_psnr(img: &DynamicImage, quality: u8) -> (Vec<u8>, f64) {
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
     let jp2_img = Image::from_rgb_bytes(w, h, rgb.as_raw())
         .expect("failed to build jp2lam Image");
-    jp2lam::encode(
+    encode_with_psnr(
         &jp2_img,
         &EncodeOptions { quality, format: OutputFormat::Jp2 },
     )

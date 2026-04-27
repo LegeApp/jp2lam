@@ -303,6 +303,120 @@ impl NativeBackend {
         let parts = self.prepare_codestream_parts(context)?;
         parts.encode(&native_emit_plan(&context.plan))
     }
+
+    /// Compute an internal PSNR estimate by simulating decoder reconstruction.
+    ///
+    /// Re-runs the encode pipeline to get PCRD-truncated layouts, applies inverse
+    /// quantization with per-block bit-plane truncation, runs the inverse DWT, undoes
+    /// MCT and DC level shift, and compares against the original pixels.
+    ///
+    /// Only valid for irreversible 9/7 lossy encodes. Returns `f64::INFINITY` for
+    /// lossless (quality == 100) encodes. Returns an error for unsupported configs.
+    pub(crate) fn compute_psnr(&self, context: &EncodeContext<'_>) -> Result<f64> {
+        if context.plan.quality >= 100 {
+            return Ok(f64::INFINITY);
+        }
+        if !matches!(context.plan.transform, WaveletTransform::Irreversible97) {
+            return Err(Jp2LamError::EncodeFailed(
+                "PSNR only supported for irreversible 9/7 encodes".to_string(),
+            ));
+        }
+
+        let width = context.plan.width as usize;
+        let height = context.plan.height as usize;
+        let precision = context.plan.components.first().map(|c| c.precision).unwrap_or(8);
+        let levels = context.plan.decomposition_levels;
+
+        // Re-run full PCRD pipeline to get the truncated pass selections.
+        let encoded_layouts = self.prepare_tier1_encoded_layouts(context)?;
+        let num_components = encoded_layouts.len();
+
+        // Reconstruct each component in the DWT domain after per-block truncation.
+        let mut reconstructed: Vec<Vec<f32>> = Vec::with_capacity(num_components);
+        for (comp_idx, layout) in encoded_layouts.iter().enumerate() {
+            let dwt_f32 = self.compute_dwt_97_f32(context, comp_idx)?;
+            let quantized = quantize_97_coefficients(
+                &dwt_f32,
+                width,
+                height,
+                levels,
+                precision,
+                &context.plan.subband_quants,
+            )?;
+
+            let mut dequant = vec![0.0f32; width * height];
+            for band in &layout.bands {
+                let step = subband_quant_step(
+                    precision,
+                    band.resolution,
+                    band.band,
+                    &context.plan.subband_quants,
+                )?;
+                for block in &band.blocks {
+                    let last_bp = block.passes.last().map(|p| p.bitplane);
+                    for y in block.y0..block.y1 {
+                        for x in block.x0..block.x1 {
+                            let q = quantized[y * width + x];
+                            dequant[y * width + x] = dequantize_truncated_coeff(q, last_bp, step);
+                        }
+                    }
+                }
+            }
+
+            crate::dwt::inverse_97_2d_in_place(&mut dequant, width, height, levels);
+            reconstructed.push(dequant);
+        }
+
+        // Undo MCT + DC level shift, compute per-sample squared error.
+        let pixel_count = width * height;
+        let mut total_sse = 0.0f64;
+        let n_samples: usize;
+
+        match context.image.colorspace {
+            crate::model::ColorSpace::Gray => {
+                n_samples = pixel_count;
+                let orig = &context.image.components[0].data;
+                let recon = &reconstructed[0];
+                for i in 0..pixel_count {
+                    let decoded = (recon[i] + 128.0).clamp(0.0, 255.0);
+                    let diff = decoded - orig[i] as f32;
+                    total_sse += (diff * diff) as f64;
+                }
+            }
+            crate::model::ColorSpace::Srgb if num_components == 3 && context.plan.use_mct => {
+                n_samples = pixel_count * 3;
+                let orig_r = &context.image.components[0].data;
+                let orig_g = &context.image.components[1].data;
+                let orig_b = &context.image.components[2].data;
+                for i in 0..pixel_count {
+                    let y = reconstructed[0][i];
+                    let cb = reconstructed[1][i];
+                    let cr = reconstructed[2][i];
+                    // Inverse ICT (ISO 15444-1 Annex G.2) + undo DC shift
+                    let r = (y + 1.402f32 * cr + 128.0).clamp(0.0, 255.0);
+                    let g = (y - 0.344_13f32 * cb - 0.714_14f32 * cr + 128.0).clamp(0.0, 255.0);
+                    let b = (y + 1.772f32 * cb + 128.0).clamp(0.0, 255.0);
+                    let dr = r - orig_r[i] as f32;
+                    let dg = g - orig_g[i] as f32;
+                    let db = b - orig_b[i] as f32;
+                    total_sse += (dr * dr + dg * dg + db * db) as f64;
+                }
+            }
+            _ => {
+                return Err(Jp2LamError::EncodeFailed(
+                    "PSNR not implemented for this colorspace configuration".to_string(),
+                ));
+            }
+        }
+
+        let mse = total_sse / n_samples as f64;
+        let max_val = ((1u32 << precision) - 1) as f64;
+        Ok(if mse < 1e-10 {
+            100.0
+        } else {
+            20.0 * (max_val / mse.sqrt()).log10()
+        })
+    }
 }
 
 fn irreversible_input_component(
@@ -535,6 +649,21 @@ fn quantize_f32_to_i32(v: f32, step: f32) -> i32 {
 
 fn native_pcrd_enabled() -> bool {
     true
+}
+
+/// Reconstruct the float value for a quantized integer coefficient truncated to
+/// `last_coded_bp` bit-planes. Uses the standard midpoint reconstruction.
+fn dequantize_truncated_coeff(q: i32, last_coded_bp: Option<u8>, step: f32) -> f32 {
+    let Some(b) = last_coded_bp else {
+        return 0.0;
+    };
+    let abs_q = q.unsigned_abs();
+    let abs_trunc = (abs_q >> b) << b;
+    if abs_trunc == 0 {
+        return 0.0;
+    }
+    let sign = if q >= 0 { 1.0f32 } else { -1.0f32 };
+    sign * (abs_trunc as f32 + 0.5) * step
 }
 
 fn apply_pcrd_selection(

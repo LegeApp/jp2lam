@@ -154,9 +154,68 @@ fn scatter_column(data: &mut [f32], stride: usize, height: usize, x: usize, valu
     }
 }
 
+/// Inverse 9/7 2-D lifting, in-place. Undoes `forward_97_2d_in_place`.
+///
+/// `data` must be in the deinterleaved JPEG 2000 subband layout produced by the
+/// forward transform. After this call, `data` holds the reconstructed signal.
+pub(crate) fn inverse_97_2d_in_place(data: &mut [f32], width: usize, height: usize, levels: u8) {
+    if width == 0 || height == 0 || levels == 0 {
+        return;
+    }
+    let resolutions = encode_resolutions(width, height, levels);
+    let max_span = width.max(height);
+    let mut scratch = vec![0f32; max_span];
+
+    for &(rw, rh) in resolutions.iter().skip(1) {
+        for y in 0..rh {
+            let row_start = y * width;
+            inverse_97_1d_in_place(&mut data[row_start..row_start + rw]);
+        }
+        for x in 0..rw {
+            gather_column(data, width, rh, x, &mut scratch[..rh]);
+            inverse_97_1d_in_place(&mut scratch[..rh]);
+            scatter_column(data, width, rh, x, &scratch[..rh]);
+        }
+    }
+}
+
+fn inverse_97_1d_in_place(samples: &mut [f32]) {
+    let n = samples.len();
+    if n < 2 {
+        if n == 1 {
+            samples[0] *= K;
+        }
+        return;
+    }
+
+    let sn = n.div_ceil(2);
+    let dn = n - sn;
+    let mut inter = vec![0f32; n];
+    for i in 0..sn {
+        inter[2 * i] = samples[i];
+    }
+    for i in 0..dn {
+        inter[2 * i + 1] = samples[sn + i];
+    }
+
+    for i in (0..n).step_by(2) {
+        inter[i] *= K;
+    }
+    for i in (1..n).step_by(2) {
+        inter[i] *= INV_K;
+    }
+
+    apply_lift(&mut inter, 0, -DELTA);
+    apply_lift(&mut inter, 1, -GAMMA);
+    apply_lift(&mut inter, 0, -BETA);
+    apply_lift(&mut inter, 1, -ALPHA);
+
+    samples.copy_from_slice(&inter);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{forward_97_1d_in_place, forward_97_2d_in_place, K, INV_K};
+    use super::{forward_97_1d_in_place, forward_97_2d_in_place, inverse_97_2d_in_place, K, INV_K};
 
     const ROUNDTRIP_TOL: f32 = 1e-3;
 
@@ -168,7 +227,7 @@ mod tests {
                 for (name, original) in tiny_patterns(width, height) {
                     let mut data = original.iter().map(|&v| v as f32).collect::<Vec<_>>();
                     forward_97_2d_in_place(&mut data, width, height, levels).expect("forward dwt");
-                    inverse_97_2d_in_place_for_test(&mut data, width, height, levels);
+                    inverse_97_2d_in_place(&mut data, width, height, levels);
                     for (idx, (&out, &orig)) in data.iter().zip(original.iter()).enumerate() {
                         let diff = (out - orig as f32).abs();
                         assert!(
@@ -206,100 +265,6 @@ mod tests {
         let mut row = [100.0f32];
         forward_97_1d_in_place(&mut row);
         assert!((row[0] - 100.0 * INV_K).abs() < 1e-5);
-    }
-
-    // ---- test-only inverse 9/7 for roundtrip verification ----
-
-    fn inverse_97_2d_in_place_for_test(
-        data: &mut [f32],
-        width: usize,
-        height: usize,
-        levels: u8,
-    ) {
-        if width == 0 || height == 0 || levels == 0 {
-            return;
-        }
-        let resolutions = encode_resolutions_for_test(width, height, levels);
-        let max_span = width.max(height);
-        let mut scratch = vec![0f32; max_span];
-
-        for &(rw, rh) in resolutions.iter().skip(1) {
-            for y in 0..rh {
-                let row_start = y * width;
-                inverse_97_1d_in_place_for_test(&mut data[row_start..row_start + rw]);
-            }
-            for x in 0..rw {
-                for y in 0..rh {
-                    scratch[y] = data[y * width + x];
-                }
-                inverse_97_1d_in_place_for_test(&mut scratch[..rh]);
-                for y in 0..rh {
-                    data[y * width + x] = scratch[y];
-                }
-            }
-        }
-    }
-
-    fn inverse_97_1d_in_place_for_test(samples: &mut [f32]) {
-        let n = samples.len();
-        if n < 2 {
-            if n == 1 {
-                samples[0] *= K;
-            }
-            return;
-        }
-
-        // Re-interleave [low | high] -> [s0, d0, s1, d1, ...].
-        let sn = n.div_ceil(2);
-        let dn = n - sn;
-        let mut inter = vec![0f32; n];
-        for i in 0..sn {
-            inter[2 * i] = samples[i];
-        }
-        for i in 0..dn {
-            inter[2 * i + 1] = samples[sn + i];
-        }
-
-        // Undo scaling (inverse of step 5).
-        for i in (0..n).step_by(2) {
-            inter[i] *= K;
-        }
-        for i in (1..n).step_by(2) {
-            inter[i] *= INV_K;
-        }
-
-        // Reverse lifting: undo step 4 first, then 3, 2, 1.
-        apply_lift_inverse(&mut inter, 0, super::DELTA);
-        apply_lift_inverse(&mut inter, 1, super::GAMMA);
-        apply_lift_inverse(&mut inter, 0, super::BETA);
-        apply_lift_inverse(&mut inter, 1, super::ALPHA);
-
-        samples.copy_from_slice(&inter);
-    }
-
-    fn apply_lift_inverse(samples: &mut [f32], start_parity: usize, coeff: f32) {
-        let n = samples.len();
-        let mut j = start_parity;
-        while j < n {
-            let left = super::fetch_sym(samples, j as isize - 1);
-            let right = super::fetch_sym(samples, j as isize + 1);
-            samples[j] -= coeff * (left + right);
-            j += 2;
-        }
-    }
-
-    fn encode_resolutions_for_test(width: usize, height: usize, levels: u8) -> Vec<(usize, usize)> {
-        let mut resolutions = Vec::with_capacity(levels as usize + 1);
-        let mut w = width;
-        let mut h = height;
-        resolutions.push((w, h));
-        for _ in 0..levels {
-            w = w.div_ceil(2);
-            h = h.div_ceil(2);
-            resolutions.push((w, h));
-        }
-        resolutions.reverse();
-        resolutions
     }
 
     fn max_decompositions(width: usize, height: usize) -> usize {
