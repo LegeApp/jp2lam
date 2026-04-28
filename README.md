@@ -133,13 +133,13 @@ fn main() -> anyhow::Result<()> {
 The `jp2lam` command-line tool (requires `cli` feature) encodes PNG, JPEG, and other formats:
 
 ```bash
-# Encode with WebHigh preset (default)
-cargo run --release --bin jp2lam --features cli -- input.png output.jp2
+# Encode with the default quality for the detected colorspace.
+cargo run --release --features cli --bin jp2lam -- input.png
 
-# Encode with custom preset
-cargo run --release --bin jp2lam --features cli -- -p DocumentHigh input.png output.jp2
+# One-shot quality testing. Accepts q50, 50, -q 50, or --quality=q50.
+cargo run --release --features cli --bin jp2lam -- input.png q50
 
-# Available presets: DocumentLow, DocumentHigh, WebLow, WebHigh
+# Output is written under output/ as <stem>_qNN_<timestamp>.jp2.
 ```
 
 ## Preset Comparison

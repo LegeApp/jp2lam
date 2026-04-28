@@ -52,13 +52,13 @@ pub(super) fn derive_subband_quants(
     (style, bands)
 }
 
-/// Apply quality-based quantization step scaling to subband quants for quality < 50.
+/// Apply quality-based quantization step scaling to subband quants for lossy quality.
 ///
-/// Increases step size (coarser quantization) so tier-1 bitplane analysis,
-/// PCRD distortion estimates, the QCD marker, and the quantizer itself all
-/// agree on the actual step sizes used to encode the stream.
+/// q50 keeps the ISO-derived irreversible step sizes. Lower qualities increase
+/// step size for stronger quantization; higher qualities reduce step size so
+/// q95/q99 are not capped by the same coefficient precision as q50.
 pub(super) fn apply_quality_step_scaling(quants: &mut Vec<SubbandQuant>, quality: u8) {
-    if quality >= 50 {
+    if quality >= 100 {
         return;
     }
     let scale = quality_step_scaler(quality);
@@ -67,17 +67,22 @@ pub(super) fn apply_quality_step_scaling(quants: &mut Vec<SubbandQuant>, quality
     }
 }
 
-/// Returns a step-size multiplier > 1 for quality < 50, 1.0 otherwise.
+/// Returns a step-size multiplier for quality 0..99.
 ///
-/// Calibrated so q=42→1.32×, q=30→2.0×, q=10→4.0×, q=1→~5.3×.
+/// Calibrated so q=42→1.32×, q=30→2.0×, q=10→4.0×, q=1→~5.5×,
+/// q=75→0.42×, q=90→0.25×, and q=99→0.031×.
 fn quality_step_scaler(quality: u8) -> f64 {
-    if quality >= 50 {
-        return 1.0;
-    }
     if quality == 0 {
         return 8.0;
     }
-    2.0_f64.powf((50.0 - quality as f64) / 20.0)
+    if quality <= 50 {
+        2.0_f64.powf((50.0 - quality as f64) / 20.0)
+    } else if quality <= 90 {
+        2.0_f64.powf(-((quality as f64 - 50.0) / 20.0))
+    } else {
+        let t = (quality as f64 - 90.0) / 9.0;
+        0.25 * 2.0_f64.powf(-3.0 * t)
+    }
 }
 
 /// Multiply the quantization step of one subband by `scale`.
@@ -88,7 +93,7 @@ fn quality_step_scaler(quality: u8) -> f64 {
 /// encodes band gain and precision) cancels and is never needed.
 fn scale_one_quant(sq: &SubbandQuant, scale: f64) -> SubbandQuant {
     let base = 1.0 + sq.mantissa as f64 / 2048.0;
-    let scaled = (base * scale).max(1.0);
+    let scaled = (base * scale).max(1.0 / 8192.0);
     let k = scaled.log2().floor() as i32;
     let base_new = scaled / 2f64.powi(k);
     let exp_new = (sq.exponent as i32 - k).max(0) as u8;

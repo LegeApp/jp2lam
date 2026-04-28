@@ -14,6 +14,11 @@ use crate::dwt::pcrd::{
 use crate::perceptual::taubman_masking::TaubmanMaskMap;
 use crate::plan::{BandOrientation, SubbandQuant};
 
+// P1.3 (real Annex J ΔMSE) is rolled back pending lambda recalibration.
+// Keep these imports parked for when we revisit:
+// use crate::dwt::pcrd::{apply_contrast_masking_to_delta, band_distortion_bias};
+// use crate::profile::class_distortion_weight;
+
 use super::t1::{NativeEncodedTier1CodeBlock, NativeEncodedTier1Layout};
 
 /// Estimated packet-header signaling cost per included code-block (bytes).
@@ -24,14 +29,6 @@ use super::t1::{NativeEncodedTier1CodeBlock, NativeEncodedTier1Layout};
 /// the slope from "omit block" to "include first pass" reflects the real cost,
 /// without affecting the marginal slope between consecutive included passes.
 const HEADER_OVERHEAD_BYTES: u32 = 2;
-
-fn active_distortion_model(quality: u8, has_taubman: bool) -> DistortionModel {
-    if has_taubman && quality < 30 {
-        DistortionModel::Taubman2000
-    } else {
-        DistortionModel::PassKindAware
-    }
-}
 
 /// Build pruned PCRD hull curves for every code-block in a Tier-1 layout.
 ///
@@ -49,43 +46,35 @@ pub(crate) fn curves_from_tier1_layout(
     subband_quants: &[SubbandQuant],
     precision: u32,
     quality: u8,
+    component_weight: f64,
     contrast_mask: Option<&crate::perceptual::ContrastMaskMap>,
     taubman_weights: Option<&[f64]>,
 ) -> Result<Vec<CodeBlockPcrdCurve>, PcrdError> {
     let mut curves = Vec::new();
     let mut next_id = 0usize;
-    let model = active_distortion_model(quality, taubman_weights.is_some());
+
+    // Heuristic distortion model (pass-kind-aware). Rolled back from real
+    // Annex J ΔMSE (P1.3) until lambda calibration is updated to match the new
+    // image-domain MSE scale. Contrast/Taubman/class/band weights all live
+    // inside the model dispatcher itself.
+    let _ = (contrast_mask, taubman_weights);
 
     for band in &layout.bands {
         let weight = subband_weight_for(num_resolutions, band.resolution, band.band);
+        let band_kind = band_kind_for(band.band);
         let quant_step = subband_quants
             .iter()
             .find(|sq| sq.resolution == band.resolution && sq.band == band.band)
             .map(|sq| quant_step_from_subband(*sq, precision))
             .unwrap_or(1.0);
-        let band_kind = band_kind_for(band.band);
         for block in &band.blocks {
-            let contrast_weight = compute_block_contrast_weight(
-                contrast_mask,
-                block,
-                band.resolution,
-                band.band,
-                num_resolutions,
-            );
-            let taubman_w = taubman_weights
-                .and_then(|ws| ws.get(next_id))
-                .copied()
-                .unwrap_or(1.0);
             let raws = raw_records_for_block(
                 block,
                 weight,
                 quant_step,
-                band_kind,
-                band.resolution,
                 quality,
-                contrast_weight,
-                taubman_w,
-                model,
+                band_kind,
+                component_weight,
             );
             curves.push(build_hull_curve(next_id, &raws)?);
             next_id += 1;
@@ -140,47 +129,42 @@ fn raw_records_for_block(
     block: &NativeEncodedTier1CodeBlock,
     subband_weight: f64,
     quant_step: f64,
-    band_kind: BandKind,
-    resolution: u8,
     quality: u8,
-    contrast_visibility_weight: f64,
-    taubman_masking_weight: f64,
-    model: DistortionModel,
+    band_kind: BandKind,
+    component_weight: f64,
 ) -> Vec<RawPassRecord> {
-    use crate::encode::backend::native::t1::NativeTier1PassKind;
+    use super::t1::NativeTier1PassKind;
 
     let mut prev_cumulative = 0u32;
     let mut records = Vec::with_capacity(block.passes.len());
 
     for pass in &block.passes {
-        let (pass_kind, newly_significant, refinement_samples) = match pass.kind {
-            NativeTier1PassKind::MagnitudeRefinement => {
-                (PassKind::MagnitudeRefinement, 0, pass.significant_before)
-            }
-            NativeTier1PassKind::Cleanup => {
-                (PassKind::Cleanup, pass.newly_significant, 0)
-            }
-            _ => (PassKind::SignificancePropagation, pass.newly_significant, 0),
+        let pass_kind = match pass.kind {
+            NativeTier1PassKind::SignificancePropagation => PassKind::SignificancePropagation,
+            NativeTier1PassKind::MagnitudeRefinement => PassKind::MagnitudeRefinement,
+            NativeTier1PassKind::Cleanup => PassKind::Cleanup,
         };
-
+        let refinement_samples = match pass_kind {
+            PassKind::MagnitudeRefinement => pass.significant_before,
+            _ => 0,
+        };
         let ctx = PassDistortionContext {
-            pass_kind,
             bitplane: pass.bitplane,
-            newly_significant,
-            refinement_samples,
-            subband_weight,
             quant_step,
+            subband_weight,
             band_kind,
+            pass_kind,
+            newly_significant: pass.newly_significant,
+            refinement_samples,
             quality,
             block_class: block.block_class,
-            contrast_visibility_weight,
-            taubman_masking_weight,
+            contrast_visibility_weight: 1.0,
+            taubman_masking_weight: 1.0,
         };
-        let distortion_delta = estimate_pass_distortion_delta_with_model(&ctx, model);
+        let distortion_delta =
+            estimate_pass_distortion_delta_with_model(&ctx, DistortionModel::PassKindAware)
+                * component_weight;
 
-        // Offset cumulative by the header overhead so the "omit → first pass"
-        // slope accounts for the per-block packet signaling cost. Each subsequent
-        // pass's incremental bytes are unaffected because we track prev_cumulative.
         let cumulative = pass.cumulative_length as u32 + HEADER_OVERHEAD_BYTES;
         let incremental = cumulative - prev_cumulative;
         prev_cumulative = cumulative;
@@ -315,6 +299,7 @@ mod tests {
             &context.plan.subband_quants,
             precision,
             context.plan.quality,
+            1.0,
             None, // No contrast masking in test
             None, // No taubman masking in test
         )

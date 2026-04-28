@@ -1435,12 +1435,24 @@ pub fn quality_to_lambda(quality: u8, pixel_count: u32) -> f64 {
     let log_lambda = 5.68 - 2.618 * t.powf(0.85);
     let base_lambda = 10f64.powf(log_lambda).max(1e-3);
 
+    // q90..q99 needs a steeper tail than the mid-range curve. At that end the
+    // quantizer is already using finer step sizes, and keeping lambda too high
+    // can paradoxically retain fewer passes than a lower-quality encode. Fade
+    // lambda toward zero so q99 means "all available lossy 9/7 passes"; q100 is
+    // still handled separately as reversible lossless.
+    let tail_multiplier = if quality >= 90 {
+        let tail = (99.0 - quality.min(99) as f64) / 9.0;
+        tail * tail
+    } else {
+        1.0
+    };
+
     // Resolution scaling: smaller images need lower lambda (larger files per pixel)
     // to maintain consistent visual quality despite fixed overhead
     const REFERENCE_PIXELS: f64 = 12_000_000.0; // 4000×3000
     let resolution_factor = (pixel_count as f64 / REFERENCE_PIXELS).powf(0.35);
 
-    base_lambda * resolution_factor
+    base_lambda * resolution_factor * tail_multiplier
 }
 
 /// Select passes based on quality (via lambda), not byte budget.

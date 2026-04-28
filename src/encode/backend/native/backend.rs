@@ -310,15 +310,21 @@ impl NativeBackend {
     /// quantization with per-block bit-plane truncation, runs the inverse DWT, undoes
     /// MCT and DC level shift, and compares against the original pixels.
     ///
-    /// Only valid for irreversible 9/7 lossy encodes. Returns `f64::INFINITY` for
+    /// Only valid for irreversible 9/7 lossy encodes. Returns infinity/1.0 for
     /// lossless (quality == 100) encodes. Returns an error for unsupported configs.
-    pub(crate) fn compute_psnr(&self, context: &EncodeContext<'_>) -> Result<f64> {
+    pub(crate) fn compute_quality_metrics(
+        &self,
+        context: &EncodeContext<'_>,
+    ) -> Result<crate::encode::EncodeMetrics> {
         if context.plan.quality >= 100 {
-            return Ok(f64::INFINITY);
+            return Ok(crate::encode::EncodeMetrics {
+                psnr_db: f64::INFINITY,
+                ssim: 1.0,
+            });
         }
         if !matches!(context.plan.transform, WaveletTransform::Irreversible97) {
             return Err(Jp2LamError::EncodeFailed(
-                "PSNR only supported for irreversible 9/7 encodes".to_string(),
+                "quality metrics only supported for irreversible 9/7 encodes".to_string(),
             ));
         }
 
@@ -367,8 +373,10 @@ impl NativeBackend {
             reconstructed.push(dequant);
         }
 
-        // Undo MCT + DC level shift, compute per-sample squared error.
+        // Build decoded luma pixels for SSIM and per-channel pixels for PSNR.
         let pixel_count = width * height;
+        let mut decoded_luma = vec![0.0f32; pixel_count];
+        let mut orig_luma = vec![0.0f32; pixel_count];
         let mut total_sse = 0.0f64;
         let n_samples: usize;
 
@@ -381,6 +389,8 @@ impl NativeBackend {
                     let decoded = (recon[i] + 128.0).clamp(0.0, 255.0);
                     let diff = decoded - orig[i] as f32;
                     total_sse += (diff * diff) as f64;
+                    decoded_luma[i] = decoded;
+                    orig_luma[i] = orig[i] as f32;
                 }
             }
             crate::model::ColorSpace::Srgb if num_components == 3 && context.plan.use_mct => {
@@ -389,33 +399,42 @@ impl NativeBackend {
                 let orig_g = &context.image.components[1].data;
                 let orig_b = &context.image.components[2].data;
                 for i in 0..pixel_count {
-                    let y = reconstructed[0][i];
+                    let yc = reconstructed[0][i];
                     let cb = reconstructed[1][i];
                     let cr = reconstructed[2][i];
                     // Inverse ICT (ISO 15444-1 Annex G.2) + undo DC shift
-                    let r = (y + 1.402f32 * cr + 128.0).clamp(0.0, 255.0);
-                    let g = (y - 0.344_13f32 * cb - 0.714_14f32 * cr + 128.0).clamp(0.0, 255.0);
-                    let b = (y + 1.772f32 * cb + 128.0).clamp(0.0, 255.0);
+                    let r = (yc + 1.402f32 * cr + 128.0).clamp(0.0, 255.0);
+                    let g = (yc - 0.344_13f32 * cb - 0.714_14f32 * cr + 128.0).clamp(0.0, 255.0);
+                    let b = (yc + 1.772f32 * cb + 128.0).clamp(0.0, 255.0);
                     let dr = r - orig_r[i] as f32;
                     let dg = g - orig_g[i] as f32;
                     let db = b - orig_b[i] as f32;
                     total_sse += (dr * dr + dg * dg + db * db) as f64;
+                    // BT.601 luma for SSIM
+                    decoded_luma[i] = 0.299f32 * r + 0.587f32 * g + 0.114f32 * b;
+                    orig_luma[i] = 0.299f32 * orig_r[i] as f32
+                        + 0.587f32 * orig_g[i] as f32
+                        + 0.114f32 * orig_b[i] as f32;
                 }
             }
             _ => {
                 return Err(Jp2LamError::EncodeFailed(
-                    "PSNR not implemented for this colorspace configuration".to_string(),
+                    "quality metrics not implemented for this colorspace configuration".to_string(),
                 ));
             }
         }
 
         let mse = total_sse / n_samples as f64;
         let max_val = ((1u32 << precision) - 1) as f64;
-        Ok(if mse < 1e-10 {
+        let psnr_db = if mse < 1e-10 {
             100.0
         } else {
             20.0 * (max_val / mse.sqrt()).log10()
-        })
+        };
+
+        let ssim = mssim_8x8(&orig_luma, &decoded_luma, width, height);
+
+        Ok(crate::encode::EncodeMetrics { psnr_db, ssim })
     }
 }
 
@@ -679,26 +698,11 @@ fn apply_pcrd_selection(
     let pixel_count = context.image.width * context.image.height;
     let contrast_mask = build_luma_contrast_mask(context);
 
-    // For low-bitrate (quality < 30) irreversible encodes, compute Taubman §VI
-    // masking weights from the pre-quantization DWT coefficients.
-    let use_taubman = quality < 30
-        && matches!(context.plan.transform, crate::plan::WaveletTransform::Irreversible97);
-
-    let backend = NativeBackend;
+    // P1.3 (real ΔMSE + Taubman masking) rolled back; rate.rs uses heuristic
+    // distortion model and ignores both contrast_mask and taubman_weights.
     for (component_index, layout) in layouts.iter_mut().enumerate() {
-        let taubman_weights: Option<Vec<f64>> = if use_taubman {
-            match backend.compute_dwt_97_f32(context, component_index) {
-                Ok(dwt_f32) => Some(rate::build_taubman_weights_for_layout(
-                    layout,
-                    &dwt_f32,
-                    context.plan.width as usize,
-                    context.plan.num_resolutions,
-                )),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+        let taubman_weights: Option<Vec<f64>> = None;
+        let component_weight = pcrd_component_weight(context, component_index);
 
         let precision = context.plan.components.first().map(|c| c.precision).unwrap_or(8);
         let curves = rate::curves_from_tier1_layout(
@@ -707,6 +711,7 @@ fn apply_pcrd_selection(
             &context.plan.subband_quants,
             precision,
             quality,
+            component_weight,
             contrast_mask.as_ref(),
             taubman_weights.as_deref(),
         )
@@ -728,6 +733,28 @@ fn apply_pcrd_selection(
         truncate_layout_passes(layout, &selected_passes)?;
     }
     Ok(())
+}
+
+fn pcrd_component_weight(context: &EncodeContext<'_>, component_index: usize) -> f64 {
+    use crate::model::ColorSpace;
+
+    if !context.plan.use_mct || !matches!(context.image.colorspace.encoding_domain(), ColorSpace::Srgb) {
+        return 1.0;
+    }
+
+    match component_index {
+        0 => 1.0,
+        // ICT chroma coefficients have lower variance than luma. Without a
+        // compensating PCRD weight, low and mid qualities drop chroma blocks too
+        // early and RGB output collapses toward grey. The boost is strongest at
+        // the low-bitrate end and fades near q99 to avoid wasting bits when the
+        // ordinary slope distribution is already dense.
+        1 | 2 => {
+            let q = context.plan.quality.min(99) as f64;
+            1.20 + 1.80 * (1.0 - q / 99.0).powf(0.70)
+        }
+        _ => 1.0,
+    }
 }
 
 /// Build contrast mask map from the luma component.
@@ -917,4 +944,56 @@ fn native_emit_plan(plan: &EncodingPlan) -> EncodingPlan {
 
 fn native_use_mct(plan: &EncodingPlan) -> bool {
     plan.use_mct
+}
+
+/// Mean SSIM over non-overlapping 8×8 luma blocks.
+/// Wang et al. (2004), constants from the standard formulation.
+fn mssim_8x8(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f64 {
+    const BLOCK: usize = 8;
+    const C1: f64 = 6.502_5;   // (0.01 * 255)^2
+    const C2: f64 = 58.522_5;  // (0.03 * 255)^2
+
+    let block_rows = height / BLOCK;
+    let block_cols = width / BLOCK;
+    if block_rows == 0 || block_cols == 0 {
+        return 1.0;
+    }
+
+    let mut ssim_sum = 0.0f64;
+    let n = (BLOCK * BLOCK) as f64;
+
+    for br in 0..block_rows {
+        for bc in 0..block_cols {
+            let mut sum_x = 0.0f64;
+            let mut sum_y = 0.0f64;
+            let mut sum_xx = 0.0f64;
+            let mut sum_yy = 0.0f64;
+            let mut sum_xy = 0.0f64;
+
+            for dy in 0..BLOCK {
+                for dx in 0..BLOCK {
+                    let idx = (br * BLOCK + dy) * width + (bc * BLOCK + dx);
+                    let x = orig[idx] as f64;
+                    let y = recon[idx] as f64;
+                    sum_x += x;
+                    sum_y += y;
+                    sum_xx += x * x;
+                    sum_yy += y * y;
+                    sum_xy += x * y;
+                }
+            }
+
+            let ux = sum_x / n;
+            let uy = sum_y / n;
+            let sx2 = (sum_xx / n - ux * ux).max(0.0);
+            let sy2 = (sum_yy / n - uy * uy).max(0.0);
+            let sxy = sum_xy / n - ux * uy;
+
+            let num = (2.0 * ux * uy + C1) * (2.0 * sxy + C2);
+            let den = (ux * ux + uy * uy + C1) * (sx2 + sy2 + C2);
+            ssim_sum += num / den;
+        }
+    }
+
+    ssim_sum / (block_rows * block_cols) as f64
 }

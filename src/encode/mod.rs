@@ -110,18 +110,25 @@ pub fn encode_to_writer<W: Write>(
         .map_err(|err| Jp2LamError::EncodeFailed(err.to_string()))
 }
 
-/// Encode and compute an internal PSNR estimate in one call.
+/// Image quality metrics from an encode cycle.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeMetrics {
+    /// PSNR in dB. `f64::INFINITY` for lossless encodes.
+    pub psnr_db: f64,
+    /// Mean SSIM over 8×8 luma blocks, in [0, 1]. Higher is better.
+    /// 1.0 for lossless encodes.
+    pub ssim: f64,
+}
+
+/// Encode and compute internal quality metrics (PSNR + SSIM) in one call.
 ///
-/// The PSNR is computed by simulating the decoder: re-running the encoder
-/// pipeline to get PCRD-truncated coefficients, applying inverse quantization
-/// and inverse DWT, and comparing against the original pixels.
-///
-/// Returns `(encoded_bytes, psnr_db)`. For lossless encodes (quality == 100)
-/// `psnr_db` is `f64::INFINITY`.
-pub fn encode_with_psnr(image: &Image, options: &EncodeOptions) -> Result<(Vec<u8>, f64)> {
+/// Simulates decoder reconstruction internally — no external decoder needed.
+/// For lossless encodes (quality == 100), returns `psnr_db = f64::INFINITY`
+/// and `ssim = 1.0`.
+pub fn encode_with_psnr(image: &Image, options: &EncodeOptions) -> Result<(Vec<u8>, EncodeMetrics)> {
     let bytes = encode(image, options)?;
     let context = EncodeContext::new(image, options)?;
     let native = NativeBackend;
-    let psnr = native.compute_psnr(&context)?;
-    Ok((bytes, psnr))
+    let metrics = native.compute_quality_metrics(&context)?;
+    Ok((bytes, metrics))
 }

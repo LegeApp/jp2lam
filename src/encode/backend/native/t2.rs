@@ -535,6 +535,7 @@ mod tests {
             length,
             cumulative_length: 0,
             distortion_hint: 0,
+            mse_numerator: 0.0,
             bytes: Vec::new(),
         }
     }

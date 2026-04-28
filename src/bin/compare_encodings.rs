@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use image::DynamicImage;
-use jp2lam::{EncodeOptions, Image, OutputFormat, encode_with_psnr};
+use jp2lam::{EncodeOptions, EncodeMetrics, Image, OutputFormat, encode_with_psnr};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -44,8 +44,8 @@ fn main() {
     );
     println!("Output:  {}", out_dir.display());
     println!();
-    println!("{:<36} {:>10} {:>7} {:>8}", "file", "bytes", "bpp", "PSNR dB");
-    println!("{}", "-".repeat(66));
+    println!("{:<36} {:>10} {:>7} {:>8} {:>7}", "file", "bytes", "bpp", "PSNR dB", "SSIM");
+    println!("{}", "-".repeat(75));
 
     // Quality sweep: covers the full 0-100 range at meaningful intervals
     let variants: &[(&str, u8)] = &[
@@ -68,27 +68,33 @@ fn main() {
         let filename = format!("{stem}_{suffix}");
         let out_path = out_dir.join(&filename);
 
-        let (bytes, psnr) = encode_jp2_with_psnr(&img, *quality);
+        let (bytes, metrics) = encode_jp2_with_psnr(&img, *quality);
         let bpp = bytes.len() as f64 * 8.0 / n_pixels as f64;
         fs::write(&out_path, &bytes).expect("failed to write output");
 
-        let psnr_str = if psnr.is_infinite() {
+        let psnr_str = if metrics.psnr_db.is_infinite() {
             "lossless".to_string()
         } else {
-            format!("{psnr:.2}")
+            format!("{:.2}", metrics.psnr_db)
+        };
+        let ssim_str = if metrics.ssim >= 0.9999 && metrics.psnr_db.is_infinite() {
+            "1.000".to_string()
+        } else {
+            format!("{:.4}", metrics.ssim)
         };
 
         println!(
-            "{:<36} {:>10} {:>7.3} {:>8}",
+            "{:<36} {:>10} {:>7.3} {:>8} {:>7}",
             filename,
             fmt(bytes.len()),
             bpp,
             psnr_str,
+            ssim_str,
         );
     }
 }
 
-fn encode_jp2_with_psnr(img: &DynamicImage, quality: u8) -> (Vec<u8>, f64) {
+fn encode_jp2_with_psnr(img: &DynamicImage, quality: u8) -> (Vec<u8>, EncodeMetrics) {
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
     let jp2_img = Image::from_rgb_bytes(w, h, rgb.as_raw())

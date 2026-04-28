@@ -127,7 +127,7 @@ pub(crate) struct NativeTier1Pass {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NativeEncodedTier1Pass {
     pub kind: NativeTier1PassKind,
     pub bitplane: u8,
@@ -146,6 +146,10 @@ pub(crate) struct NativeEncodedTier1Pass {
     pub length: usize,
     pub cumulative_length: usize,
     pub distortion_hint: u32,
+    /// Annex J ΔMSE numerator in quantized-coefficient units (pre-scaling by
+    /// quant_step² × subband_weight). Computed from actual coefficient values;
+    /// rate.rs scales this to image-domain MSE for PCRD slope calculation.
+    pub mse_numerator: f64,
     pub bytes: Vec<u8>,
 }
 
@@ -358,7 +362,7 @@ fn encode_codeblock_with_policy(
     // Most-significant bitplane: Cleanup only.
     {
         let coding_style = pass_coding_style(policy, NativeTier1PassKind::Cleanup, top, block);
-        let newly_significant = cleanup_encode(&mut coder, block, top, &mut flags);
+        let (newly_significant, cl_mse) = cleanup_encode(&mut coder, block, top, &mut flags);
         let cl_bytes = finalize_pass_bytes(
             &mut coder,
             coding_style.mode,
@@ -376,6 +380,7 @@ fn encode_codeblock_with_policy(
             coding_style.segmark,
             0,
             newly_significant,
+            cl_mse,
             cl_bytes,
             block,
         );
@@ -399,7 +404,7 @@ fn encode_codeblock_with_policy(
             block,
         );
         initialize_pass_coder(&mut coder, sp_style.mode);
-        let newly_significant =
+        let (sp_ns, sp_mse) =
             sigpass_encode(&mut coder, block, bitplane, &mut flags, sp_style.mode);
         let sp_bytes = finalize_pass_bytes(
             &mut coder,
@@ -417,11 +422,12 @@ fn encode_codeblock_with_policy(
             sp_style.termination,
             sp_style.segmark,
             significant_before_sp,
-            newly_significant,
+            sp_ns,
+            sp_mse,
             sp_bytes,
             block,
         );
-        significant_so_far += newly_significant;
+        significant_so_far += sp_ns;
         pass_index += 1;
 
         let mr_style = pass_coding_style(
@@ -431,7 +437,7 @@ fn encode_codeblock_with_policy(
             block,
         );
         initialize_pass_coder(&mut coder, mr_style.mode);
-        refpass_encode_mut(&mut coder, block, bitplane, &mut flags, mr_style.mode);
+        let mr_mse = refpass_encode_mut(&mut coder, block, bitplane, &mut flags, mr_style.mode);
         let mr_bytes = finalize_pass_bytes(
             &mut coder,
             mr_style.mode,
@@ -449,13 +455,14 @@ fn encode_codeblock_with_policy(
             mr_style.segmark,
             significant_before_sp,
             0,
+            mr_mse,
             mr_bytes,
             block,
         );
         pass_index += 1;
 
         let cl_style = pass_coding_style(policy, NativeTier1PassKind::Cleanup, bitplane, block);
-        let newly_significant = cleanup_encode(&mut coder, block, bitplane, &mut flags);
+        let (cl_ns, cl_mse) = cleanup_encode(&mut coder, block, bitplane, &mut flags);
         let cl_bytes = finalize_pass_bytes(
             &mut coder,
             cl_style.mode,
@@ -472,11 +479,12 @@ fn encode_codeblock_with_policy(
             cl_style.termination,
             cl_style.segmark,
             significant_so_far,
-            newly_significant,
+            cl_ns,
+            cl_mse,
             cl_bytes,
             block,
         );
-        significant_so_far += newly_significant;
+        significant_so_far += cl_ns;
         pass_index += 1;
 
         clear_visited_all(&mut flags, block.width, block.height);
@@ -504,23 +512,22 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
     let estimated_capacity = (block.width * block.height) / 2 + 64;
     let mut coder = MqCoder::with_capacity(estimated_capacity);
     let mut flags = FlagGrid::new(block.width, block.height);
-    // (kind, bitplane, newly_significant, snapshot_after)
-    // (kind, bitplane, newly_significant, snapshot_after, significant_before)
-    let mut metas: Vec<(NativeTier1PassKind, u8, usize, usize, usize)> = Vec::with_capacity(block.coding_passes.len());
+    // (kind, bitplane, newly_significant, snapshot_after, significant_before, mse_numerator)
+    let mut metas: Vec<(NativeTier1PassKind, u8, usize, usize, usize, f64)> = Vec::with_capacity(block.coding_passes.len());
     let mut significant_so_far = 0usize;
 
     let top = block.magnitude_bitplanes - 1;
 
     // Most-significant bitplane: cleanup only, no SP/MR.
-    let ns = cleanup_encode(&mut coder, block, top, &mut flags);
-    metas.push((NativeTier1PassKind::Cleanup, top, ns, coder.numbytes(), 0));
+    let (ns, cl_mse) = cleanup_encode(&mut coder, block, top, &mut flags);
+    metas.push((NativeTier1PassKind::Cleanup, top, ns, coder.numbytes(), 0, cl_mse));
     significant_so_far += ns;
     clear_visited_all(&mut flags, block.width, block.height);
 
     for bitplane in (0..top).rev() {
         let significant_before_sp = significant_so_far;
 
-        let ns = sigpass_encode(
+        let (sp_ns, sp_mse) = sigpass_encode(
             &mut coder,
             block,
             bitplane,
@@ -530,13 +537,14 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
         metas.push((
             NativeTier1PassKind::SignificancePropagation,
             bitplane,
-            ns,
+            sp_ns,
             coder.numbytes(),
             significant_before_sp,
+            sp_mse,
         ));
-        significant_so_far += ns;
+        significant_so_far += sp_ns;
 
-        refpass_encode_mut(
+        let mr_mse = refpass_encode_mut(
             &mut coder,
             block,
             bitplane,
@@ -549,11 +557,12 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
             0,
             coder.numbytes(),
             significant_before_sp,
+            mr_mse,
         ));
 
-        let ns = cleanup_encode(&mut coder, block, bitplane, &mut flags);
-        metas.push((NativeTier1PassKind::Cleanup, bitplane, ns, coder.numbytes(), significant_so_far));
-        significant_so_far += ns;
+        let (cl_ns, cl_mse) = cleanup_encode(&mut coder, block, bitplane, &mut flags);
+        metas.push((NativeTier1PassKind::Cleanup, bitplane, cl_ns, coder.numbytes(), significant_so_far, cl_mse));
+        significant_so_far += cl_ns;
 
         clear_visited_all(&mut flags, block.width, block.height);
     }
@@ -568,7 +577,7 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
     let mut sum_lengths = 0usize;
     let last_idx = metas.len() - 1;
 
-    for (i, (kind, bitplane, ns, snap, sb)) in metas.iter().copied().enumerate() {
+    for (i, (kind, bitplane, ns, snap, sb, mse)) in metas.iter().copied().enumerate() {
         let mut length = snap.saturating_sub(prev_snap);
         prev_snap = snap;
         if i == last_idx {
@@ -597,6 +606,7 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
             length,
             cumulative_length: cumulative,
             distortion_hint: distortion_hint(bitplane, ns, block.max_magnitude),
+            mse_numerator: mse,
             bytes,
         });
         
@@ -644,6 +654,7 @@ fn append_pass(
     segmark: bool,
     significant_before: usize,
     newly_significant: usize,
+    mse_numerator: f64,
     bytes: Vec<u8>,
     block: &NativeTier1CodeBlock,
 ) {
@@ -682,6 +693,7 @@ fn append_pass(
         length,
         cumulative_length: *cumulative_length,
         distortion_hint: distortion_hint(bitplane, newly_significant, block.max_magnitude),
+        mse_numerator,
         bytes,
     });
 }
@@ -782,11 +794,12 @@ fn sigpass_encode(
     bitplane: u8,
     flags: &mut FlagGrid,
     mode: NativeTier1PassCodingMode,
-) -> usize {
+) -> (usize, f64) {
     let w = block.width;
     let h = block.height;
     let one = 1u32 << bitplane;
     let mut newly_significant = 0usize;
+    let mut mse_num = 0.0f64;
 
     let full_stripes = h / 4;
     let rem = h % 4;
@@ -795,7 +808,7 @@ fn sigpass_encode(
         for x in 0..w {
             for ci in 0..4usize {
                 let y = k + ci;
-                sigpass_step(coder, block, x, y, w, one, flags, &mut newly_significant, mode);
+                sigpass_step(coder, block, x, y, w, one, flags, &mut newly_significant, &mut mse_num, mode);
             }
         }
     }
@@ -804,12 +817,12 @@ fn sigpass_encode(
         for x in 0..w {
             for ci in 0..rem {
                 let y = k + ci;
-                sigpass_step(coder, block, x, y, w, one, flags, &mut newly_significant, mode);
+                sigpass_step(coder, block, x, y, w, one, flags, &mut newly_significant, &mut mse_num, mode);
             }
         }
     }
 
-    newly_significant
+    (newly_significant, mse_num)
 }
 
 #[inline]
@@ -822,6 +835,7 @@ fn sigpass_step(
     one: u32,
     flags: &mut FlagGrid,
     newly_significant: &mut usize,
+    mse_num: &mut f64,
     mode: NativeTier1PassCodingMode,
 ) {
     if flags.is_significant(x, y) {
@@ -847,6 +861,10 @@ fn sigpass_step(
         encode_symbol(coder, mode, sign_ctx, sign_bit ^ prediction);
         flags.mark_significant(x, y, sign_bit);
         *newly_significant += 1;
+        // Annex J ΔMSE for a newly significant coefficient at bitplane `b`:
+        //   mse_num = (mag + 0.5)² - lo²  where lo = mag & (one - 1)
+        let lo = (mag & (one - 1)) as f64;
+        *mse_num += (mag as f64 + 0.5).powi(2) - lo * lo;
     }
 }
 
@@ -863,15 +881,16 @@ fn refpass_encode_mut(
     bitplane: u8,
     flags: &mut FlagGrid,
     mode: NativeTier1PassCodingMode,
-) {
+) -> f64 {
     let w = block.width;
     let h = block.height;
     let one = 1u32 << bitplane;
+    let mut mse_num = 0.0f64;
 
     let full_stripes = h / 4;
     let rem = h % 4;
 
-    let do_col = |coder: &mut MqCoder, flags: &mut FlagGrid, x: usize, y: usize| {
+    let mut refine = |coder: &mut MqCoder, flags: &mut FlagGrid, x: usize, y: usize| {
         if !flags.is_significant(x, y) || flags.is_visited(x, y) {
             return;
         }
@@ -882,12 +901,18 @@ fn refpass_encode_mut(
         let plane_bit = ((mag & one) != 0) as u8;
         encode_symbol(coder, mode, ctx, plane_bit);
         flags.mark_refined(x, y);
+        // Annex J ΔMSE for MR at bitplane b:
+        //   mse_num = lo_hi² - lo_lo²
+        //   lo_hi = mag & ((one<<1) - 1),  lo_lo = mag & (one - 1)
+        let lo_lo = (mag & (one - 1)) as f64;
+        let lo_hi = (mag & ((one << 1) - 1)) as f64;
+        mse_num += lo_hi * lo_hi - lo_lo * lo_lo;
     };
 
     for k in (0..full_stripes * 4).step_by(4) {
         for x in 0..w {
             for ci in 0..4usize {
-                do_col(coder, flags, x, k + ci);
+                refine(coder, flags, x, k + ci);
             }
         }
     }
@@ -895,10 +920,12 @@ fn refpass_encode_mut(
         let k = full_stripes * 4;
         for x in 0..w {
             for ci in 0..rem {
-                do_col(coder, flags, x, k + ci);
+                refine(coder, flags, x, k + ci);
             }
         }
     }
+
+    mse_num
 }
 
 // ---------------------------------------------------------------------------
@@ -916,29 +943,30 @@ fn cleanup_encode(
     block: &NativeTier1CodeBlock,
     bitplane: u8,
     flags: &mut FlagGrid,
-) -> usize {
+) -> (usize, f64) {
     let w = block.width;
     let h = block.height;
     let one = 1u32 << bitplane;
     let mut newly_significant = 0usize;
+    let mut mse_num = 0.0f64;
 
     let full_stripes = h / 4;
     let rem = h % 4;
 
     for k in (0..full_stripes * 4).step_by(4) {
         for x in 0..w {
-            cleanup_stripe(coder, block, x, k, 4, one, flags, &mut newly_significant);
+            cleanup_stripe(coder, block, x, k, 4, one, flags, &mut newly_significant, &mut mse_num);
         }
     }
     if rem > 0 {
         let k = full_stripes * 4;
         for x in 0..w {
             // Partial stripes never use AGG (spec §C.3.2); use regular per-sample coding.
-            cleanup_stripe_partial(coder, block, x, k, rem, one, flags, &mut newly_significant);
+            cleanup_stripe_partial(coder, block, x, k, rem, one, flags, &mut newly_significant, &mut mse_num);
         }
     }
 
-    newly_significant
+    (newly_significant, mse_num)
 }
 
 /// Full 4-row stripe — may use AGG coding when the stripe is clean.
@@ -951,6 +979,7 @@ fn cleanup_stripe(
     one: u32,
     flags: &mut FlagGrid,
     newly_significant: &mut usize,
+    mse_num: &mut f64,
 ) {
     debug_assert_eq!(lim, 4);
     let w = block.width;
@@ -975,6 +1004,7 @@ fn cleanup_stripe(
                 let y = k + rl;
                 // SAFETY: x < w and y < height, so y*w+x is always in bounds
                 let coeff = unsafe { *block.coefficients.get_unchecked(y * w + x) };
+                let mag = coeff.unsigned_abs();
                 let sign_bit = (coeff < 0) as u8;
                 let (sign_lut_index, _) = flags.cardinal_sign_context(x, y);
                 let sign_ctx = sign_context(sign_lut_index);
@@ -983,12 +1013,14 @@ fn cleanup_stripe(
                 flags.mark_significant(x, y, sign_bit);
                 *newly_significant += 1;
                 flags.clear_visited(x, y);
+                let lo = (mag & (one - 1)) as f64;
+                *mse_num += (mag as f64 + 0.5).powi(2) - lo * lo;
             }
 
             // Regular ZC coding for samples after the run-length position.
             for ci in (rl + 1)..lim {
                 let y = k + ci;
-                cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, w);
+                cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, mse_num, w);
             }
         } else {
             // All 4 samples are insignificant at this bitplane: encode runlen=4.
@@ -1003,7 +1035,7 @@ fn cleanup_stripe(
         // Regular per-sample coding.
         for ci in 0..lim {
             let y = k + ci;
-            cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, w);
+            cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, mse_num, w);
         }
     }
 }
@@ -1018,11 +1050,12 @@ fn cleanup_stripe_partial(
     one: u32,
     flags: &mut FlagGrid,
     newly_significant: &mut usize,
+    mse_num: &mut f64,
 ) {
     let w = block.width;
     for ci in 0..lim {
         let y = k + ci;
-        cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, w);
+        cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, mse_num, w);
     }
 }
 
@@ -1038,6 +1071,7 @@ fn cleanup_sample_regular(
     one: u32,
     flags: &mut FlagGrid,
     newly_significant: &mut usize,
+    mse_num: &mut f64,
     w: usize,
 ) {
     let visited = flags.is_visited(x, y);
@@ -1071,6 +1105,8 @@ fn cleanup_sample_regular(
         coder.encode_with_ctx(sign_ctx, sign_bit ^ prediction);
         flags.mark_significant(x, y, sign_bit);
         *newly_significant += 1;
+        let lo = (mag & (one - 1)) as f64;
+        *mse_num += (mag as f64 + 0.5).powi(2) - lo * lo;
     }
 }
 

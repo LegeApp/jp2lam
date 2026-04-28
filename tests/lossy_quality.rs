@@ -1,4 +1,4 @@
-use jp2lam::{encode, ColorSpace, Component, EncodeOptions, Image, OutputFormat, Preset};
+use jp2lam::{encode, ColorSpace, Component, EncodeOptions, Image, OutputFormat};
 use std::fs;
 use std::path::PathBuf;
 
@@ -109,7 +109,7 @@ fn lossy_rgb_quality_ladder_is_valid_and_ordered() {
     let mut sizes = Vec::new();
 
     for &quality in qualities {
-        let options = EncodeOptions { preset: Preset::Image, quality, format: OutputFormat::Jp2 };
+        let options = EncodeOptions { quality, format: OutputFormat::Jp2 };
         let bytes = encode(&image, &options)
             .unwrap_or_else(|e| panic!("encode failed at quality {quality}: {e}"));
 
@@ -143,7 +143,7 @@ fn lossy_rgb_quality_ladder_is_valid_and_ordered() {
     // Lossless pass.
     let lossless = encode(
         &image,
-        &EncodeOptions { preset: Preset::Image, quality: 100, format: OutputFormat::Jp2 },
+        &EncodeOptions { quality: 100, format: OutputFormat::Jp2 },
     )
     .expect("lossless encode failed");
     write_jp2("lear_rgb_q100", &lossless);
@@ -164,8 +164,7 @@ fn lossy_gray_quality_ladder_is_valid_and_ordered() {
     let mut sizes = Vec::new();
 
     for &quality in qualities {
-        let options =
-            EncodeOptions { preset: Preset::Mixed, quality, format: OutputFormat::Jp2 };
+        let options = EncodeOptions { quality, format: OutputFormat::Jp2 };
         let bytes = encode(&image, &options)
             .unwrap_or_else(|e| panic!("encode failed at quality {quality}: {e}"));
 
@@ -203,7 +202,7 @@ fn lossless_rgb_produces_valid_jp2() {
         Some(img) => img,
         None => return,
     };
-    let options = EncodeOptions { preset: Preset::Image, quality: 100, format: OutputFormat::Jp2 };
+    let options = EncodeOptions { quality: 100, format: OutputFormat::Jp2 };
     let bytes = encode(&image, &options).expect("lossless encode failed");
     write_jp2("lear_rgb_lossless", &bytes);
     assert!(is_valid_jp2(&bytes), "lossless output is not a valid JP2");
