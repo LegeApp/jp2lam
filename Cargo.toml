@@ -33,6 +33,7 @@ image = { version = "0.25.9", optional = true, default-features = false, feature
 rayon = { version = "1.10" }
 
 [dev-dependencies]
+image = { version = "0.25.9", default-features = false, features = ["png"] }
 tempfile = "3"
 
 [profile.release]

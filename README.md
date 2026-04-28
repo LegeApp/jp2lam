@@ -1,203 +1,195 @@
-# jp2lam – Lean and Mean JPEG 2000 Encoder
+# jp2lam
 
-A high-performance, production-ready JPEG 2000 (JP2/J2K) encoder written in Rust. Optimized for document and web imaging workloads with intelligent quality presets, perceptual masking, and PCRD-driven compression.
+Lean JPEG 2000 encoding in Rust.
 
-## Features
+`jp2lam` writes JPEG 2000 Part 1 images as either JP2 files or raw J2K codestreams. It is built for callers that want a small, direct API: pass grayscale or sRGB bytes, choose JP2 or J2K, and set `quality` from `0` to `100`.
 
-### Encoding Modes
-- **Four quality presets** targeting different use cases:
-  - `DocumentLow` (q=30): Extreme compression for scanned documents
-  - `DocumentHigh` (q=85): High-fidelity document archival
-  - `WebLow` (q=42): Web delivery with aggressive optimization
-  - `WebHigh` (q=62): Web delivery with visual fidelity
+The library API exposes encoding, writer-based encoding, metrics-assisted encoding, timing output, error types, image models, options, formats, and presets from the crate root. :contentReference[oaicite:1]{index=1}
 
-### Compression Architecture
-- **Wavelet Transforms**
-  - Reversible 5/3 integer lifting (lossless only, perfect reconstruction)
-  - Irreversible 9/7 float lifting (lossy, production default for all presets)
-  
-- **Color Space Handling**
-  - Automatic MCT (Multiple Component Transform) for RGB→YCbCr conversion
-  - ICT (Irreversible Color Transform) for lossy encoding
-  - Proper luma/chroma scaling and rounding
-  
-- **Adaptive Quantization**
-  - Scalar Expounded Quantization (lossy) with JPEG 2000 standard encoding
-  - Quality-based step scaling: qualities < 50 dynamically scale quantization for smooth output
-  - Subband-specific exponent and mantissa calculation
+## Highlights
 
-- **PCRD Optimization** (Post-Compression Rate-Distortion)
-  - Lambda-driven optimal truncation point selection per code block
-  - Quality→lambda calibration with built-in presets
-  - Resolution-scaled distortion estimates
-  - Smooth band distortion biasing for low-quality output
+- Encode 8-bit grayscale or 8-bit sRGB input.
+- Write JP2 wrapper files or raw J2K codestreams.
+- Use one numeric quality value: `0..=100`.
+- `quality < 100`: lossy irreversible 9/7 wavelet.
+- `quality = 100`: lossless reversible 5/3 wavelet.
+- Optional PSNR/SSIM helper through `encode_with_psnr`.
+- Optional CLI behind the `cli` feature.
+- Library mode avoids the CLI image-loading stack; `image` and `chrono` are only enabled by `cli`. :contentReference[oaicite:2]{index=2}
 
-- **Perceptual Masking**
-  - 8×8 DCT-based local contrast masking
-  - Edge-aware texture analysis via quadrant variance
-  - White-region visibility override (near-white blocks get deprioritized in PCRD)
-  - Automatic visibility weighting from 1.0 (normal) to 0.05 (bright white)
+## Install
 
-### Output Formats
-- `JP2` (JPEG 2000 Part 1): Full-featured with JP2 signature box and extended metadata
-- `J2K` (JPEG 2000 codestream): Bare codestream for embedding in other containers
-
-### Technical Details
-- **Code Block Size**: Fixed 64×64 (maximum standard block size)
-- **Decomposition Levels**: Auto-capped based on image dimensions (max 6 for RGB, 5 for grayscale)
-- **Progression Order**: LRCP (Layer-Resolution-Component-Position)
-- **Marker Support**: SIZ (image size), COD (coding style), QCD (quantization default)
-- **Guard Bits**: 2 (standard value for irreversible transform)
-- **Parallel Processing**: Rayon-driven multi-threaded tile and layer encoding
-
-## Installation
-
-Add to `Cargo.toml`:
 ```toml
 [dependencies]
 jp2lam = "0.1"
+````
+
+Minimum Rust version from the crate manifest:
+
+```text
+Rust 1.85+
 ```
 
-### Requirements
-- **Rust**: 1.95 or later
-- **Dependencies**: rayon (automatic)
-- **No external C libraries required** – fully Rust implementation
+## Quick start
 
-## Quick Start
-
-### Basic Encoding
+### Encode RGB to JP2
 
 ```rust
-use jp2lam::{Image, Component, EncodeOptions, Preset, OutputFormat};
+use jp2lam::{EncodeOptions, Image, OutputFormat};
 
-fn main() -> anyhow::Result<()> {
-    // Prepare 8-bit RGB image data
+fn main() -> jp2lam::Result<()> {
     let width = 800;
     let height = 600;
-    let rgb_bytes = vec![0u8; (width * height * 3) as usize];
-    
-    // Create components (RGB)
-    let components = vec![
-        Component {
-            data: rgb_bytes[0..].iter().step_by(3).cloned().collect(),
-            width,
-            height,
-            precision: 8,
-            signed: false,
-            dx: 1,
-            dy: 1,
-        },
-        Component {
-            data: rgb_bytes[1..].iter().step_by(3).cloned().collect(),
-            width,
-            height,
-            precision: 8,
-            signed: false,
-            dx: 1,
-            dy: 1,
-        },
-        Component {
-            data: rgb_bytes[2..].iter().step_by(3).cloned().collect(),
-            width,
-            height,
-            precision: 8,
-            signed: false,
-            dx: 1,
-            dy: 1,
-        },
-    ];
-    
-    // Build image
-    let image = Image {
-        width,
-        height,
-        components,
-        colorspace: jp2lam::ColorSpace::Srgb,
-    };
-    
-    // Encode with WebHigh preset
+    let rgb = vec![128u8; width * height * 3];
+
+    let image = Image::from_rgb_bytes(width as u32, height as u32, &rgb)?;
+
     let options = EncodeOptions {
-        preset: Preset::WebHigh,
+        quality: 75,
         format: OutputFormat::Jp2,
     };
-    
-    let jp2_bytes = jp2lam::encode(&image, &options)?;
-    std::fs::write("output.jp2", jp2_bytes)?;
-    
+
+    let bytes = jp2lam::encode(&image, &options)?;
+    std::fs::write("output.jp2", bytes)?;
+
     Ok(())
 }
 ```
 
-### Using the CLI Tool
+### Encode grayscale to raw J2K
 
-The `jp2lam` command-line tool (requires `cli` feature) encodes PNG, JPEG, and other formats:
+```rust
+use jp2lam::{EncodeOptions, Image, OutputFormat};
 
-```bash
-# Encode with the default quality for the detected colorspace.
-cargo run --release --features cli --bin jp2lam -- input.png
+fn main() -> jp2lam::Result<()> {
+    let width = 800;
+    let height = 600;
+    let gray = vec![240u8; width * height];
 
-# One-shot quality testing. Accepts q50, 50, -q 50, or --quality=q50.
-cargo run --release --features cli --bin jp2lam -- input.png q50
+    let image = Image::from_gray_bytes(width as u32, height as u32, &gray)?;
 
-# Output is written under output/ as <stem>_qNN_<timestamp>.jp2.
+    let options = EncodeOptions {
+        quality: 85,
+        format: OutputFormat::J2k,
+    };
+
+    let bytes = jp2lam::encode(&image, &options)?;
+    std::fs::write("page.j2k", bytes)?;
+
+    Ok(())
+}
 ```
 
-## Preset Comparison
+## Quality guide
 
-| Preset | Quality | Transform | MCT | Use Case |
-|--------|---------|-----------|-----|----------|
-| **DocumentLow** | 30 | 9/7 | Yes | Extreme compression, scanned docs |
-| **DocumentHigh** | 85 | 9/7 | Yes | High-fidelity document archival |
-| **WebLow** | 42 | 9/7 | Yes | Web delivery (aggressive) |
-| **WebHigh** | 62 | 9/7 | Yes | Web delivery (quality) |
+`quality` controls the compression tradeoff. It is not a literal percentage of visual fidelity.
 
-All presets use the Irreversible 9/7 wavelet (production default). Quality-based quantization step scaling is applied automatically for q < 50.
+|  Quality | Use case                                                                    |
+| -------: | --------------------------------------------------------------------------- |
+|  `0..25` | Very small output, previews, stress testing                                 |
+| `30..50` | Compact lossy output                                                        |
+| `60..85` | Practical range for documents, screenshots, illustrations, and mixed images |
+| `90..99` | High-fidelity lossy output                                                  |
+|    `100` | Lossless output                                                             |
 
-## Architecture
+## Supported input
 
-### Encoding Pipeline
+* 8-bit unsigned grayscale.
+* 8-bit unsigned sRGB.
+* Full-size, non-subsampled components.
+* Images at least `2x2`.
+* Interleaved RGB input through `Image::from_rgb_bytes`.
+* Grayscale input through `Image::from_gray_bytes`.
 
-1. **Input Validation**: Verify 8-bit unsigned components, consistent dimensions
-2. **Color Transform**: RGB→YCbCr via ICT if MCT enabled
-3. **Forward DWT**: 9/7 float lifting with symmetric extension
-4. **Quantization**: Scalar Expounded with subband-specific exponents/mantissas
-5. **Tier-1 Coding**: Bit-plane entropy encoding (significance propagation, magnitude refinement, cleanup)
-6. **PCRD Analysis**: Lambda-driven optimal truncation selection per code block
-7. **Packet Assembly**: LRCP order with perceptual weighting
-8. **Marker Layout**: SIZ, COD, QCD, SOT, SOP, SOD, EOC
+## CLI
 
-### Perceptual Optimization
+The CLI is optional:
 
-The encoder uses local contrast masking to guide bit allocation:
-- High-contrast regions (edges, text): higher visibility weight → more bits
-- Smooth regions: lower weight → fewer bits  
-- Near-white regions: visibility override down to 0.05 (reserved for structure)
+```bash
+cargo run --release --features cli --bin jp2lam -- input.png
+cargo run --release --features cli --bin jp2lam -- input.png q50
+cargo run --release --features cli --bin jp2lam -- input.png -q 75
+cargo run --release --features cli --bin jp2lam -- input.png --quality=q95
+```
 
-This ensures compression artifacts are kept in perceptually less-sensitive areas.
+The CLI reads image files through the optional `image` dependency and writes JP2 output under `output/`.
 
-## Performance Characteristics
+## Compare quality levels
 
-### vs. JPEG
-- **Bitrate advantage**: 15–30% file size reduction at equal visual quality (moderate-to-high bitrates)
-- **Low bitrate**: JPEG competitive at extreme compression (< 0.1 bpp); JP2 wins at 0.3+ bpp
-- **Artifact profile**: Wavelet ringing (in flat regions) vs. JPEG blocking; both perceptually optimized
+The `compare_encodings` helper encodes one input at several quality levels and reports size and quality metrics:
 
-### Encoding Speed
-- Single-threaded: ~1–3 MiB/s depending on preset (rough estimate)
-- Multi-threaded (rayon): Near-linear speedup on 4+ cores
+```bash
+cargo run --release --features cli --bin compare_encodings -- input.png
+```
 
-## Input Requirements
+## Metrics
 
-- **Format**: 8-bit unsigned integer per component
-- **Color Space**: Grayscale or sRGB
-- **Dimensions**: Any size ≥ 2×2 (no practical limit)
-- **Subsampling**: Not supported; all components must match dimensions
+Use `encode_with_psnr` when you want encoded bytes plus internal PSNR/SSIM estimates:
 
-## Dependencies
+```rust
+use jp2lam::{EncodeOptions, Image, OutputFormat};
 
-- **rayon** (1.10+) – Data parallelism for tile and layer encoding
+fn main() -> jp2lam::Result<()> {
+    let width = 800;
+    let height = 600;
+    let gray = vec![240u8; width * height];
 
-No external C/C++ libraries or system dependencies required.
+    let image = Image::from_gray_bytes(width as u32, height as u32, &gray)?;
+    let options = EncodeOptions {
+        quality: 75,
+        format: OutputFormat::Jp2,
+    };
+
+    let result = jp2lam::encode_with_psnr(&image, &options)?;
+
+    println!("bytes: {}", result.bytes.len());
+    println!("psnr: {:?}", result.psnr);
+    println!("ssim: {:?}", result.ssim);
+
+    Ok(())
+}
+```
+
+Adjust field names above if your current `EncodeMetrics` return shape differs.
+
+## What it does internally
+
+The encoder pipeline is organized around the standard JPEG 2000 stages:
+
+1. Validate image and component metadata.
+2. Prepare image samples.
+3. Apply color transform where needed.
+4. Run reversible 5/3 or irreversible 9/7 DWT.
+5. Quantize lossy coefficients.
+6. Encode code-block bit-planes with Tier-1 coding.
+7. Select truncation points with PCRD.
+8. Build packets and packet headers.
+9. Write codestream markers.
+10. Wrap the codestream in JP2 boxes when requested.
+
+The crate also has an explicit geometry layer for tiles, tile-components, subbands, precincts, and code-blocks. The current encoder uses a single full-image tile, with the geometry kept centralized for the encoder stages that need it.
+
+## Features
+
+Default library build:
+
+```toml
+jp2lam = "0.1"
+```
+
+Optional CLI:
+
+```toml
+jp2lam = { version = "0.1", features = ["cli"] }
+```
+
+Available feature flags:
+
+| Feature    | Purpose                                             |
+| ---------- | --------------------------------------------------- |
+| `cli`      | Enables the command-line tools and image-file input |
+| `profile`  | Enables profiling hooks                             |
+| `counters` | Exposes internal encoding counters                  |
 
 ## Testing
 
@@ -205,29 +197,12 @@ No external C/C++ libraries or system dependencies required.
 cargo test
 ```
 
-Tests cover:
-- Wavelet norm tables (5/3 and 9/7)
-- Quantization step size encoding
-- Plan generation and decomposition level capping
-- Rate-quality curves
-- Round-trip DCT masking
-
 ## License
 
-Dual-licensed under MIT or Apache-2.0.
+Dual-licensed under either:
 
-## Use Cases
+* MIT
+* Apache-2.0
 
-- **Document Archival**: High-fidelity preservation of scanned documents (DocumentHigh)
-- **Web Delivery**: Efficient distribution of photographs and illustrations (WebLow/WebHigh)
-- **Content Management Systems**: Backend image processing for mixed media
-- **Embedded Systems**: Compact image compression without external dependencies
-
-## Future Enhancements
-
-Potential additions (not currently implemented):
-- Lossless 5/3 optimization (currently production default is irreversible 9/7)
-- Region-of-Interest (ROI) encoding
-- Tiling (currently single-tile per image)
-- Extended marker sets (COM, TLM)
-- Progressive streaming with Quality Layers
+```
+```
