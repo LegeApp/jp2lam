@@ -1,28 +1,29 @@
 # jp2lam
 
-Lean JPEG 2000 encoding in Rust.
+JPEG 2000 Part 1 encoding in Rust, with focused JP2 decoding for document image workflows.
 
-`jp2lam` writes JPEG 2000 Part 1 images as either JP2 files or raw J2K codestreams. It is built for callers that want a small, direct API: pass grayscale or sRGB bytes, choose JP2 or J2K, and set `quality` from `0` to `100`.
+`jp2lam` writes 8-bit grayscale or sRGB images as JP2 files or raw J2K codestreams. It also includes a narrow decoder aimed at the JP2 page images commonly found in Internet Archive book listings, including `_jp2.zip` archives and extracted `*_jp2/` folders.
 
-The library API exposes encoding, writer-based encoding, metrics-assisted encoding, timing output, error types, image models, options, formats, and presets from the crate root. :contentReference[oaicite:1]{index=1}
+The current goal is practical document-image interoperability first: a small Rust API, explicit unsupported-feature errors, and code organized around the JPEG 2000 standard rather than OpenJPEG internals.
 
 ## Highlights
 
 - Encode 8-bit grayscale or 8-bit sRGB input.
 - Write JP2 wrapper files or raw J2K codestreams.
-- Use one numeric quality value: `0..=100`.
+- Decode Internet Archive-style JP2 page images into the crate's native `Image` model.
+- Batch encode or decode folders whose images share dimensions, color model, and precision; encoded batches also share quality and format.
+- Use one numeric encoder quality value: `0..=100`.
 - `quality < 100`: lossy irreversible 9/7 wavelet.
 - `quality = 100`: lossless reversible 5/3 wavelet.
 - Optional PSNR/SSIM helper through `encode_with_psnr`.
 - Optional CLI behind the `cli` feature.
-- Library mode avoids the CLI image-loading stack; `image` and `chrono` are only enabled by `cli`. :contentReference[oaicite:2]{index=2}
 
 ## Install
 
 ```toml
 [dependencies]
 jp2lam = "0.1"
-````
+```
 
 Minimum Rust version from the crate manifest:
 
@@ -30,20 +31,19 @@ Minimum Rust version from the crate manifest:
 Rust 1.85+
 ```
 
-## Quick start
+## Quick Start
 
-### Encode RGB to JP2
+### Encode RGB To JP2
 
 ```rust
 use jp2lam::{EncodeOptions, Image, OutputFormat};
 
-fn main() -> jp2lam::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = 800;
     let height = 600;
     let rgb = vec![128u8; width * height * 3];
 
     let image = Image::from_rgb_bytes(width as u32, height as u32, &rgb)?;
-
     let options = EncodeOptions {
         quality: 75,
         format: OutputFormat::Jp2,
@@ -56,35 +56,77 @@ fn main() -> jp2lam::Result<()> {
 }
 ```
 
-### Encode grayscale to raw J2K
+### Decode JP2
 
 ```rust
-use jp2lam::{EncodeOptions, Image, OutputFormat};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("page.jp2")?;
+    let image = jp2lam::decode_jp2(&bytes)?;
 
-fn main() -> jp2lam::Result<()> {
-    let width = 800;
-    let height = 600;
-    let gray = vec![240u8; width * height];
-
-    let image = Image::from_gray_bytes(width as u32, height as u32, &gray)?;
-
-    let options = EncodeOptions {
-        quality: 85,
-        format: OutputFormat::J2k,
-    };
-
-    let bytes = jp2lam::encode(&image, &options)?;
-    std::fs::write("page.j2k", bytes)?;
+    println!(
+        "{}x{} {:?} components={}",
+        image.width,
+        image.height,
+        image.colorspace,
+        image.components.len()
+    );
 
     Ok(())
 }
 ```
 
-## Quality guide
+### Batch Encode Matching Pages
+
+Use `BatchEncoder` when a folder or page stream comes from the same source and should keep one consistent image profile and encode configuration.
+
+```rust
+use jp2lam::{BatchEncoder, EncodeOptions, Image, OutputFormat};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let width = 2550;
+    let height = 3300;
+    let pages: Vec<Vec<u8>> = load_grayscale_pages();
+
+    let options = EncodeOptions {
+        quality: 85,
+        format: OutputFormat::Jp2,
+    };
+    let mut encoder = BatchEncoder::new(options);
+
+    for (idx, page) in pages.iter().enumerate() {
+        let image = Image::from_gray_bytes(width, height, page)?;
+        let bytes = encoder.encode_one(&image)?;
+        std::fs::write(format!("page_{idx:04}.jp2"), bytes)?;
+    }
+
+    Ok(())
+}
+
+fn load_grayscale_pages() -> Vec<Vec<u8>> {
+    todo!("load pages from your own folder or pipeline")
+}
+```
+
+`BatchDecoder` provides the matching decode path and rejects later items whose decoded image profile does not match the first page.
+
+## Decoder Scope
+
+The decoder is intentionally focused. It currently targets JP2 wrapper files with JPEG 2000 Part 1 codestreams that match the Internet Archive page-image outputs tested during development:
+
+- 8-bit unsigned grayscale or enumerated sRGB JP2 images.
+- Single full-image tile.
+- LRCP progression.
+- Default MQ code-block style.
+- No precinct, SOP, or EPH marker syntax.
+- Common Archive.org `_jp2.zip` and extracted `*_jp2/` page-image layouts through the CLI.
+
+This is not a universal JPEG 2000 or JPX decoder yet. Palettes, component mapping boxes, per-component bit-depth boxes, ICC color profiles, multiple codestream boxes, unsupported progression orders, and other out-of-scope features fail explicitly.
+
+## Quality Guide
 
 `quality` controls the compression tradeoff. It is not a literal percentage of visual fidelity.
 
-|  Quality | Use case                                                                    |
+| Quality  | Use case                                                                    |
 | -------: | --------------------------------------------------------------------------- |
 |  `0..25` | Very small output, previews, stress testing                                 |
 | `30..50` | Compact lossy output                                                        |
@@ -92,14 +134,22 @@ fn main() -> jp2lam::Result<()> {
 | `90..99` | High-fidelity lossy output                                                  |
 |    `100` | Lossless output                                                             |
 
-## Supported input
+## Supported Input
 
-* 8-bit unsigned grayscale.
-* 8-bit unsigned sRGB.
-* Full-size, non-subsampled components.
-* Images at least `2x2`.
-* Interleaved RGB input through `Image::from_rgb_bytes`.
-* Grayscale input through `Image::from_gray_bytes`.
+Encoder input:
+
+- 8-bit unsigned grayscale.
+- 8-bit unsigned sRGB.
+- Full-size, non-subsampled components.
+- Images at least `2x2`.
+- Interleaved RGB input through `Image::from_rgb_bytes`.
+- Grayscale input through `Image::from_gray_bytes`.
+
+Decoder input:
+
+- JP2 files accepted by the focused decoder scope above.
+- Complete in-memory byte slices through `decode_jp2`.
+- Reader-backed input through `decode_from_reader`.
 
 ## CLI
 
@@ -107,19 +157,26 @@ The CLI is optional:
 
 ```bash
 cargo run --release --features cli --bin jp2lam -- input.png
-cargo run --release --features cli --bin jp2lam -- input.png q50
-cargo run --release --features cli --bin jp2lam -- input.png -q 75
-cargo run --release --features cli --bin jp2lam -- input.png --quality=q95
+cargo run --release --features cli --bin jp2lam -- encode input.png q75
+cargo run --release --features cli --bin jp2lam -- encode-dir pages_png/ pages_jp2/ q85
+cargo run --release --features cli --bin jp2lam -- decode page.jp2 page.png
+cargo run --release --features cli --bin jp2lam -- decode-dir book_jp2/ book_png/
+cargo run --release --features cli --bin jp2lam -- decode-zip book_jp2.zip book_png/
 ```
 
-The CLI reads image files through the optional `image` dependency and writes JP2 output under `output/`.
+The CLI reads normal image files through the optional `image` dependency, writes encoded JP2 output, and writes decoded pages as PNG files. `decode-zip` also walks nested ZIP entries and preserves the archive-relative output layout.
 
-## Compare quality levels
+## Batch API
 
-The `compare_encodings` helper encodes one input at several quality levels and reports size and quality metrics:
+The batch API is for callers handling a sequence of images from one source. It does not require a folder abstraction in the library itself; external programs can walk their own directories and feed each page to `BatchEncoder` or `BatchDecoder`.
 
-```bash
-cargo run --release --features cli --bin compare_encodings -- input.png
+`BatchEncoder` checks dimensions, color model, component precision, component sampling, quality, and output format against the first image. `BatchDecoder` checks the decoded image profile against the first decoded page. The current implementation mainly centralizes validation and call shape; it is also the place to add future buffer reuse or shared setup without changing external callers.
+
+Convenience helpers are available when all inputs are already in memory:
+
+```rust
+let encoded_pages = jp2lam::encode_batch(images.iter(), &options)?;
+let decoded_pages = jp2lam::decode_batch(jp2_streams.iter().map(Vec::as_slice))?;
 ```
 
 ## Metrics
@@ -140,19 +197,17 @@ fn main() -> jp2lam::Result<()> {
         format: OutputFormat::Jp2,
     };
 
-    let result = jp2lam::encode_with_psnr(&image, &options)?;
+    let (bytes, metrics) = jp2lam::encode_with_psnr(&image, &options)?;
 
-    println!("bytes: {}", result.bytes.len());
-    println!("psnr: {:?}", result.psnr);
-    println!("ssim: {:?}", result.ssim);
+    println!("bytes: {}", bytes.len());
+    println!("psnr: {:?}", metrics.psnr_db);
+    println!("ssim: {:?}", metrics.ssim);
 
     Ok(())
 }
 ```
 
-Adjust field names above if your current `EncodeMetrics` return shape differs.
-
-## What it does internally
+## What It Does Internally
 
 The encoder pipeline is organized around the standard JPEG 2000 stages:
 
@@ -195,14 +250,12 @@ Available feature flags:
 
 ```bash
 cargo test
+cargo test --features cli
 ```
 
 ## License
 
 Dual-licensed under either:
 
-* MIT
-* Apache-2.0
-
-```
-```
+- MIT
+- Apache-2.0
