@@ -11,3 +11,5 @@ pub(crate) use irrev97::forward_97_2d_in_place;
 pub(crate) use irrev97::inverse_97_2d_in_place;
 #[allow(unused_imports)]
 pub(crate) use rev53::forward_53_2d_in_place;
+#[allow(unused_imports)]
+pub(crate) use rev53::inverse_53_2d_in_place;

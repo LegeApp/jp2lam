@@ -37,6 +37,13 @@ impl TilePartPayload {
             Self::PacketSequence(sequence) => sequence.write_to(out),
         }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.byte_len());
+        self.write_to(&mut out);
+        out
+    }
 }
 
 #[cfg(test)]

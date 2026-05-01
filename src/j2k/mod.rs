@@ -1,4 +1,5 @@
 mod markers;
+pub(crate) mod decode_markers;
 mod parse;
 mod types;
 mod write;
@@ -11,6 +12,18 @@ pub(crate) const MARKER_SOC: u16 = 0xff4f;
 pub(crate) const MARKER_SOT: u16 = 0xff90;
 pub(crate) const MARKER_SOD: u16 = 0xff93;
 pub(crate) const MARKER_EOC: u16 = 0xffd9;
+pub(crate) const MARKER_COM: u16 = 0xff64;
+pub(crate) const MARKER_CAP: u16 = 0xff50;
+pub(crate) const MARKER_COC: u16 = 0xff53;
+pub(crate) const MARKER_TLM: u16 = 0xff55;
+pub(crate) const MARKER_PLM: u16 = 0xff57;
+pub(crate) const MARKER_PLT: u16 = 0xff58;
+pub(crate) const MARKER_QCC: u16 = 0xff5d;
+pub(crate) const MARKER_RGN: u16 = 0xff5e;
+pub(crate) const MARKER_POC: u16 = 0xff5f;
+pub(crate) const MARKER_PPM: u16 = 0xff60;
+pub(crate) const MARKER_PPT: u16 = 0xff61;
+pub(crate) const MARKER_CRG: u16 = 0xff63;
 
 pub(crate) fn build_main_header_segments(plan: &EncodingPlan) -> Result<Vec<Vec<u8>>> {
     Ok(vec![

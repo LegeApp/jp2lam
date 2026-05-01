@@ -1,4 +1,4 @@
-use jp2lam::{encode, print_timing_data, ColorSpace, Component, EncodeOptions, Image, OutputFormat, Preset};
+use jp2lam::{encode, print_timing_data, ColorSpace, Component, EncodeOptions, Image, OutputFormat};
 #[cfg(feature = "counters")]
 use jp2lam::print;
 use std::path::PathBuf;
@@ -72,7 +72,6 @@ fn run_benchmark(name: &str, image: &Image, quality: u8) {
     for i in 0..iterations {
         let start = Instant::now();
         let bytes = encode(&image, &EncodeOptions {
-            preset: Preset::Image,
             quality,
             format: OutputFormat::Jp2,
         }).expect("encode failed");

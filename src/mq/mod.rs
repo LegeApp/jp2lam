@@ -27,6 +27,133 @@ pub(crate) struct MqCoder {
     ctxs: [u8; MQC_NUMCTXS],
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MqDecoder<'a> {
+    bytes: &'a [u8],
+    bp: usize,
+    a: u32,
+    c: u32,
+    ct: u32,
+    ctxs: [u8; MQC_NUMCTXS],
+}
+
+impl<'a> MqDecoder<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        let mut decoder = Self {
+            bytes,
+            bp: 0,
+            a: 0x8000,
+            c: if bytes.is_empty() {
+                0xff << 16
+            } else {
+                u32::from(bytes[0]) << 16
+            },
+            ct: 0,
+            ctxs: [0; MQC_NUMCTXS],
+        };
+        decoder.reset_contexts();
+        decoder.bytein();
+        decoder.c <<= 7;
+        decoder.ct = decoder.ct.saturating_sub(7);
+        decoder
+    }
+
+    pub(crate) fn decode_with_ctx(&mut self, ctx: u8) -> u8 {
+        let ctx_index = ctx as usize;
+        let state = MQ_STATES[self.ctxs[ctx_index] as usize];
+        self.a = self.a.wrapping_sub(u32::from(state.qeval));
+
+        let bit = if (self.c >> 16) < u32::from(state.qeval) {
+            self.lps_exchange(ctx_index, state)
+        } else {
+            self.c = self.c.wrapping_sub(u32::from(state.qeval) << 16);
+            if self.a & 0x8000 == 0 {
+                self.mps_exchange(ctx_index, state)
+            } else {
+                state.mps
+            }
+        };
+
+        if self.a & 0x8000 == 0 {
+            self.renormd();
+        }
+        bit
+    }
+
+    pub(crate) fn set_state(&mut self, ctx: u8, msb: u8, prob: u8) {
+        let index = msb as usize + ((prob as usize) << 1);
+        debug_assert!(index < MQ_STATES.len());
+        self.ctxs[ctx as usize] = index as u8;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_index(&self, ctx: u8) -> u8 {
+        self.ctxs[ctx as usize]
+    }
+
+    fn reset_contexts(&mut self) {
+        self.ctxs.fill(0);
+        self.set_state(T1_CTXNO_UNI, 0, 46);
+        self.set_state(T1_CTXNO_AGG, 0, 3);
+        self.set_state(T1_CTXNO_ZC, 0, 4);
+    }
+
+    fn mps_exchange(&mut self, ctx_index: usize, state: MqState) -> u8 {
+        if self.a < u32::from(state.qeval) {
+            self.ctxs[ctx_index] = state.nlps;
+            1 ^ state.mps
+        } else {
+            self.ctxs[ctx_index] = state.nmps;
+            state.mps
+        }
+    }
+
+    fn lps_exchange(&mut self, ctx_index: usize, state: MqState) -> u8 {
+        let post_subtraction_a = self.a;
+        self.a = u32::from(state.qeval);
+        if post_subtraction_a < u32::from(state.qeval) {
+            self.ctxs[ctx_index] = state.nmps;
+            state.mps
+        } else {
+            self.ctxs[ctx_index] = state.nlps;
+            1 ^ state.mps
+        }
+    }
+
+    fn renormd(&mut self) {
+        while self.a < 0x8000 {
+            if self.ct == 0 {
+                self.bytein();
+            }
+            self.a <<= 1;
+            self.c <<= 1;
+            self.ct -= 1;
+        }
+    }
+
+    fn bytein(&mut self) {
+        let next = self.byte_at(self.bp + 1);
+        if self.byte_at(self.bp) == 0xff {
+            if next > 0x8f {
+                self.c = self.c.wrapping_add(0xff00);
+                self.ct = 8;
+            } else {
+                self.bp += 1;
+                self.c = self.c.wrapping_add(u32::from(next) << 9);
+                self.ct = 7;
+            }
+        } else {
+            self.bp += 1;
+            self.c = self.c.wrapping_add(u32::from(next) << 8);
+            self.ct = 8;
+        }
+    }
+
+    fn byte_at(&self, index: usize) -> u8 {
+        self.bytes.get(index).copied().unwrap_or(0xff)
+    }
+}
+
 impl Default for MqCoder {
     fn default() -> Self {
         Self::new()
@@ -593,7 +720,7 @@ mod reference {
 
 #[cfg(test)]
 mod tests {
-    use super::{MqCoder, T1_CTXNO_AGG, T1_CTXNO_UNI, T1_CTXNO_ZC};
+    use super::{MqCoder, MqDecoder, T1_CTXNO_AGG, T1_CTXNO_UNI, T1_CTXNO_ZC};
 
     #[test]
     fn reset_initializes_special_contexts() {
@@ -641,6 +768,19 @@ mod tests {
         let produced = coder.finish();
         let expected = reference.bytes().to_vec();
         (produced, expected)
+    }
+
+    fn roundtrip_bits(bits: &[(u8, u8)]) {
+        let mut coder = MqCoder::new();
+        for &(ctx, bit) in bits {
+            coder.encode_with_ctx(ctx, bit);
+        }
+        let bytes = coder.finish();
+        let mut decoder = MqDecoder::new(&bytes);
+        for (idx, &(ctx, expected)) in bits.iter().enumerate() {
+            let actual = decoder.decode_with_ctx(ctx);
+            assert_eq!(actual, expected, "decoded bit mismatch at symbol {idx}");
+        }
     }
 
     #[test]
@@ -708,6 +848,32 @@ mod tests {
             let (a, b) = run_bits(&bits);
             assert_eq!(a, b, "randomized seed {}", seed_base);
         }
+    }
+
+    #[test]
+    fn decoder_roundtrips_mixed_contexts() {
+        let ctxs = [
+            super::T1_CTXNO_ZC,
+            super::T1_CTXNO_SC,
+            super::T1_CTXNO_MAG,
+            T1_CTXNO_AGG,
+            T1_CTXNO_UNI,
+        ];
+        let mut bits = Vec::new();
+        for i in 0..800u32 {
+            let ctx = ctxs[((i * 7) as usize) % ctxs.len()];
+            let bit = ((i.wrapping_mul(1103515245).wrapping_add(12345) >> 29) & 1) as u8;
+            bits.push((ctx, bit));
+        }
+        roundtrip_bits(&bits);
+    }
+
+    #[test]
+    fn decoder_initializes_special_contexts_like_encoder() {
+        let decoder = MqDecoder::new(&[]);
+        assert_eq!(decoder.state_index(T1_CTXNO_ZC), 8);
+        assert_eq!(decoder.state_index(T1_CTXNO_AGG), 6);
+        assert_eq!(decoder.state_index(T1_CTXNO_UNI), 92);
     }
 
     #[test]

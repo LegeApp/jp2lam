@@ -1,4 +1,5 @@
 use crate::dwt::norms::reversible_exponent;
+#[cfg(feature = "counters")]
 use crate::encode::counters;
 use crate::encode::profile_enter;
 use crate::mq::{MqCoder, T1_CTXNO_AGG, T1_CTXNO_UNI, T1_CTXNO_ZC};
@@ -9,7 +10,6 @@ use crate::tier1::helpers::{
     magnitude_context, sign_context, sign_prediction_bit, zero_coding_context,
 };
 
-#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 /// Maximum bitplane count signalled for a subband in the codestream.
@@ -194,17 +194,9 @@ pub(crate) fn analyze_component_layout_with(
 }
 
 fn analyze_subband_with_mb(subband: &NativeSubband, mb: u8) -> NativeTier1Band {
-    #[cfg(feature = "parallel")]
     let blocks = subband
         .codeblocks
         .par_iter()
-        .map(|block| analyze_codeblock(subband.resolution, subband.band, mb, block))
-        .collect();
-
-    #[cfg(not(feature = "parallel"))]
-    let blocks = subband
-        .codeblocks
-        .iter()
         .map(|block| analyze_codeblock(subband.resolution, subband.band, mb, block))
         .collect();
 
@@ -294,17 +286,9 @@ fn encode_band_with_policy(
     band: &NativeTier1Band,
     policy: &NativeTier1CodingPolicy,
 ) -> NativeEncodedTier1Band {
-    #[cfg(feature = "parallel")]
     let blocks = band
         .blocks
         .par_iter()
-        .map(|block| encode_codeblock_with_policy(block, policy))
-        .collect();
-
-    #[cfg(not(feature = "parallel"))]
-    let blocks = band
-        .blocks
-        .iter()
         .map(|block| encode_codeblock_with_policy(block, policy))
         .collect();
 
@@ -1409,6 +1393,63 @@ mod tests {
             .find(|band| band.resolution == 2 && band.band == BandOrientation::Hh)
             .expect("resolution 2 hh band");
         assert!(hh2.blocks[0].passes.is_empty());
+    }
+
+    #[test]
+    fn tier1_decoder_roundtrips_native_encoded_codeblock() {
+        let coefficients = NativeComponentCoefficients {
+            width: 4,
+            height: 4,
+            levels: 2,
+            data: vec![
+                -38, 36, 0, 16,
+                144, 0, 0, 16,
+                0, 0, 0, 0,
+                64, 64, 0, 0,
+            ],
+        };
+        let layout = build_component_layout(
+            &coefficients,
+            CodeBlockSize {
+                width: 64,
+                height: 64,
+            },
+        )
+        .expect("build layout");
+        let analyzed = analyze_component_layout(&layout);
+        let encoded = encode_placeholder_tier1(&analyzed);
+
+        let analyzed_ll = analyzed
+            .bands
+            .iter()
+            .find(|band| band.resolution == 0 && band.band == BandOrientation::Ll)
+            .expect("analyzed ll");
+        let encoded_ll = encoded
+            .bands
+            .iter()
+            .find(|band| band.resolution == 0 && band.band == BandOrientation::Ll)
+            .expect("encoded ll");
+        let source = &analyzed_ll.blocks[0];
+        let encoded_block = &encoded_ll.blocks[0];
+        let data = encoded_block
+            .passes
+            .last()
+            .expect("last pass")
+            .bytes
+            .as_slice();
+
+        let decoded = crate::decode::t1::decode_codeblock(
+            source.width,
+            source.height,
+            source.band,
+            source.zero_bitplanes + source.magnitude_bitplanes,
+            source.zero_bitplanes as u32,
+            encoded_block.passes.len() as u32,
+            data,
+        )
+        .expect("decode codeblock");
+
+        assert_eq!(decoded.coefficients, source.coefficients);
     }
 
     #[test]

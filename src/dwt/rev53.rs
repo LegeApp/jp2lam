@@ -43,6 +43,46 @@ pub(crate) fn forward_53_2d_in_place(
     Ok(())
 }
 
+pub(crate) fn inverse_53_2d_in_place(
+    data: &mut [i32],
+    width: usize,
+    height: usize,
+    levels: u8,
+) -> Result<()> {
+    let _p = profile_enter("dwt::inverse_53_2d_in_place");
+    let expected_len = width
+        .checked_mul(height)
+        .ok_or_else(|| Jp2LamError::EncodeFailed("DWT image dimensions overflow".to_string()))?;
+    if data.len() != expected_len {
+        return Err(Jp2LamError::EncodeFailed(format!(
+            "DWT input length {} did not match image area {expected_len}",
+            data.len()
+        )));
+    }
+    if width == 0 || height == 0 || levels == 0 {
+        return Ok(());
+    }
+
+    let resolutions = encode_resolutions(width, height, levels);
+    let max_span = width.max(height);
+    let mut scratch = vec![0i32; max_span];
+
+    for &(rw, rh) in resolutions.iter().skip(1) {
+        for y in 0..rh {
+            let row_start = y * width;
+            inverse_53_1d_even_in_place(&mut data[row_start..row_start + rw]);
+        }
+
+        for x in 0..rw {
+            gather_column(data, width, rh, x, &mut scratch[..rh]);
+            inverse_53_1d_even_in_place(&mut scratch[..rh]);
+            scatter_column(data, width, rh, x, &scratch[..rh]);
+        }
+    }
+
+    Ok(())
+}
+
 fn forward_53_1d_in_place(samples: &mut [i32], even: bool) {
     let width = samples.len();
     if width <= 1 {
@@ -103,6 +143,46 @@ fn forward_53_1d_in_place(samples: &mut [i32], even: bool) {
     }
 }
 
+fn inverse_53_1d_even_in_place(coefficients: &mut [i32]) {
+    let width = coefficients.len();
+    if width <= 1 {
+        return;
+    }
+
+    let sn = width.div_ceil(2);
+    let dn = width - sn;
+    let low = coefficients[..sn].to_vec();
+    let high = coefficients[sn..].to_vec();
+    let mut even = vec![0i32; sn];
+    let mut out = vec![0i32; width];
+
+    if dn == 0 {
+        coefficients.copy_from_slice(&low);
+        return;
+    }
+
+    // Undo the reversible 5/3 update step on even samples.
+    even[0] = low[0] - ((high[0] + high[0] + 2) >> 2);
+    for i in 1..sn {
+        let right = if i < dn { high[i] } else { high[i - 1] };
+        even[i] = low[i] - ((high[i - 1] + right + 2) >> 2);
+    }
+
+    // Undo the reversible 5/3 predict step on odd samples, then interleave.
+    for i in 0..sn {
+        out[2 * i] = even[i];
+    }
+    for i in 0..dn {
+        out[2 * i + 1] = if i + 1 < sn {
+            high[i] + ((even[i] + even[i + 1]) >> 1)
+        } else {
+            high[i] + even[i]
+        };
+    }
+
+    coefficients.copy_from_slice(&out);
+}
+
 fn encode_resolutions(width: usize, height: usize, levels: u8) -> Vec<(usize, usize)> {
     let mut resolutions = Vec::with_capacity(levels as usize + 1);
     let mut w = width;
@@ -131,7 +211,7 @@ fn scatter_column(data: &mut [i32], stride: usize, height: usize, x: usize, valu
 
 #[cfg(test)]
 mod tests {
-    use super::forward_53_2d_in_place;
+    use super::{forward_53_2d_in_place, inverse_53_2d_in_place};
 
     #[test]
     fn one_level_transform_matches_known_2x2_case() {
@@ -162,7 +242,7 @@ mod tests {
                 for (name, original) in tiny_patterns(width, height) {
                     let mut data = original.clone();
                     forward_53_2d_in_place(&mut data, width, height, levels).expect("forward dwt");
-                    inverse_53_2d_in_place_for_test(&mut data, width, height, levels);
+                    inverse_53_2d_in_place(&mut data, width, height, levels).expect("inverse dwt");
                     assert_eq!(
                         data, original,
                         "{name} failed for {width}x{height} with {levels} levels"
@@ -184,97 +264,13 @@ mod tests {
             for (name, original) in tiny_patterns(width, height) {
                 let mut data = original.clone();
                 forward_53_2d_in_place(&mut data, width, height, levels).expect("forward dwt");
-                inverse_53_2d_in_place_for_test(&mut data, width, height, levels);
+                inverse_53_2d_in_place(&mut data, width, height, levels).expect("inverse dwt");
                 assert_eq!(
                     data, original,
                     "{name} failed for {width}x{height} with {levels} levels"
                 );
             }
         }
-    }
-
-    fn inverse_53_2d_in_place_for_test(data: &mut [i32], width: usize, height: usize, levels: u8) {
-        if width == 0 || height == 0 || levels == 0 {
-            return;
-        }
-
-        let resolutions = encode_resolutions_for_test(width, height, levels);
-        let max_span = width.max(height);
-        let mut scratch = vec![0i32; max_span];
-
-        for &(rw, rh) in resolutions.iter().skip(1) {
-            for y in 0..rh {
-                let row_start = y * width;
-                inverse_53_1d_even_for_test(&mut data[row_start..row_start + rw]);
-            }
-
-            for x in 0..rw {
-                for y in 0..rh {
-                    scratch[y] = data[y * width + x];
-                }
-                inverse_53_1d_even_for_test(&mut scratch[..rh]);
-                for y in 0..rh {
-                    data[y * width + x] = scratch[y];
-                }
-            }
-        }
-    }
-
-    fn inverse_53_1d_even_for_test(coefficients: &mut [i32]) {
-        let width = coefficients.len();
-        if width <= 1 {
-            return;
-        }
-
-        let sn = width.div_ceil(2);
-        let dn = width - sn;
-        let low = coefficients[..sn].to_vec();
-        let high = coefficients[sn..].to_vec();
-        let mut even = vec![0i32; sn];
-        let mut out = vec![0i32; width];
-
-        if dn == 0 {
-            coefficients.copy_from_slice(&low);
-            return;
-        }
-
-        even[0] = low[0] - ((high[0] + high[0] + 2) >> 2);
-        if sn > 1 {
-            for i in 1..sn {
-                even[i] = if i < dn {
-                    low[i] - ((high[i - 1] + high[i] + 2) >> 2)
-                } else {
-                    low[i] - ((high[i - 1] + high[i - 1] + 2) >> 2)
-                };
-            }
-        }
-
-        for i in 0..sn {
-            out[2 * i] = even[i];
-        }
-        for i in 0..dn {
-            out[2 * i + 1] = if i + 1 < sn {
-                high[i] + ((even[i] + even[i + 1]) >> 1)
-            } else {
-                high[i] + even[i]
-            };
-        }
-
-        coefficients.copy_from_slice(&out);
-    }
-
-    fn encode_resolutions_for_test(width: usize, height: usize, levels: u8) -> Vec<(usize, usize)> {
-        let mut resolutions = Vec::with_capacity(levels as usize + 1);
-        let mut w = width;
-        let mut h = height;
-        resolutions.push((w, h));
-        for _ in 0..levels {
-            w = w.div_ceil(2);
-            h = h.div_ceil(2);
-            resolutions.push((w, h));
-        }
-        resolutions.reverse();
-        resolutions
     }
 
     fn max_decompositions(width: usize, height: usize) -> usize {

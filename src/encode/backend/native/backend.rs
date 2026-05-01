@@ -220,7 +220,6 @@ impl NativeBackend {
     ) -> Result<Vec<t1::NativeEncodedTier1Layout>> {
         let _p = crate::encode::profile_enter("prepare_tier1_encoded_layouts");
 
-        #[cfg(feature = "parallel")]
         let encoded_layouts: Result<Vec<_>> = {
             use rayon::prelude::*;
             (0..(context.plan.component_count as usize))
@@ -231,17 +230,6 @@ impl NativeBackend {
                     Ok(t1::encode_placeholder_tier1(&analyzed))
                 })
                 .collect()
-        };
-
-        #[cfg(not(feature = "parallel"))]
-        let encoded_layouts: Result<Vec<_>> = {
-            let mut layouts = Vec::with_capacity(context.plan.component_count as usize);
-            for component_index in 0..(context.plan.component_count as usize) {
-                let _cp = crate::encode::profile_enter("per_component_encode");
-                let analyzed = self.prepare_tier1_layout(context, component_index)?;
-                layouts.push(t1::encode_placeholder_tier1(&analyzed));
-            }
-            Ok(layouts)
         };
 
         let mut encoded_layouts = encoded_layouts?;

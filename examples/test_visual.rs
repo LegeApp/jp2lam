@@ -1,4 +1,4 @@
-use jp2lam::{encode, ColorSpace, Component, EncodeOptions, Image, OutputFormat, Preset};
+use jp2lam::{encode, ColorSpace, Component, EncodeOptions, Image, OutputFormat};
 use std::fs;
 use std::path::PathBuf;
 
@@ -60,7 +60,6 @@ fn main() {
 
     for quality in qualities {
         let options = EncodeOptions {
-            preset: Preset::Image,
             quality,
             format: OutputFormat::Jp2,
         };

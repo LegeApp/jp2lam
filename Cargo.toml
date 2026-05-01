@@ -23,7 +23,7 @@ required-features = ["cli"]
 
 [features]
 default = []
-cli          = ["dep:chrono", "dep:image"]
+cli          = ["dep:chrono", "dep:image", "dep:zip"]
 profile = []
 counters = []
 
@@ -31,6 +31,7 @@ counters = []
 chrono = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
 image = { version = "0.25.9", optional = true, default-features = false, features = ["png"] }
 rayon = { version = "1.10" }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 image = { version = "0.25.9", default-features = false, features = ["png"] }

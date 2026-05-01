@@ -215,7 +215,7 @@ fn inverse_97_1d_in_place(samples: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{forward_97_1d_in_place, forward_97_2d_in_place, inverse_97_2d_in_place, K, INV_K};
+    use super::{forward_97_1d_in_place, forward_97_2d_in_place, inverse_97_2d_in_place, INV_K};
 
     const ROUNDTRIP_TOL: f32 = 1e-3;
 
