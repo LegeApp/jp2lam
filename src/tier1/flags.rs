@@ -108,6 +108,12 @@ impl FlagGrid {
         self.flags[idx] &= !F_VISITED;
     }
 
+    pub(crate) fn clear_visited_all(&mut self) {
+        for flag in &mut self.flags {
+            *flag &= !F_VISITED;
+        }
+    }
+
     /// Mark a sample as significant and update neighbor bits incrementally
     pub(crate) fn mark_significant(&mut self, x: usize, y: usize, sign_bit: u8) {
         let idx = self.idx(x, y);

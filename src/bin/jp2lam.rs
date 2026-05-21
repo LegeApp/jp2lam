@@ -128,32 +128,29 @@ fn run_encode_dir(
     fs::create_dir_all(&output_dir)
         .map_err(|err| format!("failed to create output directory: {err}"))?;
 
-    let first_path = &files[0];
-    let first = image::open(first_path)
-        .map_err(|err| format!("failed to open input image {}: {err}", first_path.display()))?;
-    let first_image = to_jp2lam_image(first)?;
-    let quality = quality.unwrap_or_else(|| default_quality(first_image.colorspace));
+    let quality = if let Some(q) = quality {
+        q
+    } else {
+        let first = image::open(&files[0])
+            .map_err(|err| format!("failed to open input image {}: {err}", files[0].display()))?;
+        default_quality(to_jp2lam_image(first)?.colorspace)
+    };
     let options = EncodeOptions {
         quality,
         format: OutputFormat::Jp2,
     };
     let mut encoder = BatchEncoder::new(options);
-    let mut encoded_count = 0usize;
 
-    encode_dir_image(&mut encoder, &first_image, first_path, &output_dir, quality)?;
-    encoded_count += 1;
-
-    for input_path in files.iter().skip(1) {
+    for input_path in &files {
         let decoded = image::open(input_path)
             .map_err(|err| format!("failed to open input image {}: {err}", input_path.display()))?;
         let image = to_jp2lam_image(decoded)?;
         encode_dir_image(&mut encoder, &image, input_path, &output_dir, quality)?;
-        encoded_count += 1;
     }
 
     println!(
         "batch encode count={} quality={} output={}",
-        encoded_count,
+        encoder.encoded_count(),
         quality,
         output_dir.display()
     );
@@ -212,7 +209,6 @@ fn run_decode_dir(input_dir: PathBuf, output_dir: Option<PathBuf>) -> Result<(),
         .map_err(|err| format!("failed to create output directory: {err}"))?;
 
     let mut decoder = BatchDecoder::new();
-    let mut decoded_count = 0usize;
     for input_path in files {
         let bytes = fs::read(&input_path)
             .map_err(|err| format!("failed to read input file {}: {err}", input_path.display()))?;
@@ -221,13 +217,12 @@ fn run_decode_dir(input_dir: PathBuf, output_dir: Option<PathBuf>) -> Result<(),
             .map_err(|err| format!("decode failed for {}: {err}", input_path.display()))?;
         let output_path = output_dir.join(format!("{}.png", file_stem(&input_path)));
         write_image_png(&image, &output_path)?;
-        decoded_count += 1;
         println!("decoded {} -> {}", input_path.display(), output_path.display());
     }
 
     println!(
         "batch decode count={} output={}",
-        decoded_count,
+        decoder.decoded_count(),
         output_dir.display()
     );
     Ok(())
@@ -369,21 +364,13 @@ fn strip_zip_extension(path: &Path) -> PathBuf {
 }
 
 fn default_decode_output_path(input_path: &Path) -> PathBuf {
-    let stem = input_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("image");
+    let stem = file_stem(input_path);
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     PathBuf::from("output").join(format!("{stem}_decoded_{timestamp}.png"))
 }
 
 fn default_decode_zip_output_dir(input_path: &Path) -> PathBuf {
-    let stem = input_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("archive");
+    let stem = file_stem(input_path);
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     PathBuf::from("output").join(format!("{stem}_decoded_{timestamp}"))
 }

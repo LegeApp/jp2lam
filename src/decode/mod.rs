@@ -36,30 +36,14 @@ pub struct DecodeMetadata {
 /// extracts the first `jp2c` codestream box, and decodes the SIZ/COD/QCD marker
 /// segments needed by packet and Tier-1 decoding.
 pub fn inspect_jp2(bytes: &[u8]) -> Result<DecodeMetadata> {
-    let parsed = jp2_parse::parse_jp2(bytes)?;
-    let parts = codestream::parse_codestream_view(parsed.codestream)?;
-    let first_tile = parts
-        .tile_parts
-        .first()
-        .ok_or_else(|| crate::Jp2LamError::DecodeFailed("codestream has no tile-part".into()))?;
-    let codestream = CodestreamHeader::from_marker_segments_with_tile_headers(
-        parts.main_header_segments.iter().copied(),
-        first_tile.header_segments.iter().copied(),
-        first_tile.header,
-        parts.tile_parts.len(),
-    )?;
-    validate_jp2_decode_scope(&parsed.header, &codestream)?;
+    let (header, codestream, first_payload, tile_count) = parse_jp2_core(bytes)?;
     Ok(DecodeMetadata {
-        width: parsed.header.width,
-        height: parsed.header.height,
-        colorspace: parsed.header.colorspace,
-        has_ipr_metadata: parsed.header.has_ipr_metadata,
-        first_tile_payload_len: parts
-            .tile_parts
-            .first()
-            .map(|tile| tile.payload.len())
-            .unwrap_or(0),
-        tile_part_count: parts.tile_parts.len(),
+        width: header.width,
+        height: header.height,
+        colorspace: header.colorspace,
+        has_ipr_metadata: header.has_ipr_metadata,
+        first_tile_payload_len: first_payload.len(),
+        tile_part_count: tile_count,
         codestream,
     })
 }
@@ -70,22 +54,28 @@ pub fn inspect_jp2(bytes: &[u8]) -> Result<DecodeMetadata> {
 /// accepted by [`inspect_jp2`]: unsigned 8-bit grayscale or sRGB, LRCP
 /// progression, no precinct/SOP/EPH syntax, and default MQ code-block style.
 pub fn decode_jp2(bytes: &[u8]) -> Result<Image> {
+    let (header, codestream, first_payload, _) = parse_jp2_core(bytes)?;
+    let packets = t2::parse_tile_part_payload(&codestream, first_payload)?;
+    let components = t1::decode_tile_components(&codestream, &packets)?;
+    reconstruct::reconstruct_image(&codestream, header.colorspace, components)
+}
+
+fn parse_jp2_core(bytes: &[u8]) -> Result<(jp2_parse::Jp2Header, CodestreamHeader, &[u8], usize)> {
     let parsed = jp2_parse::parse_jp2(bytes)?;
     let parts = codestream::parse_codestream_view(parsed.codestream)?;
     let first_tile = parts
         .tile_parts
         .first()
         .ok_or_else(|| crate::Jp2LamError::DecodeFailed("codestream has no tile-part".into()))?;
+    let tile_count = parts.tile_parts.len();
     let codestream = CodestreamHeader::from_marker_segments_with_tile_headers(
         parts.main_header_segments.iter().copied(),
         first_tile.header_segments.iter().copied(),
         first_tile.header,
-        parts.tile_parts.len(),
+        tile_count,
     )?;
     validate_jp2_decode_scope(&parsed.header, &codestream)?;
-    let packets = t2::parse_tile_part_payload(&codestream, first_tile.payload)?;
-    let components = t1::decode_tile_components(&codestream, &packets)?;
-    reconstruct::reconstruct_image(&codestream, parsed.header.colorspace, components)
+    Ok((parsed.header, codestream, first_tile.payload, tile_count))
 }
 
 fn validate_jp2_decode_scope(

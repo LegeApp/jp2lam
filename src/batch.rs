@@ -7,7 +7,6 @@ pub struct BatchProfile {
     pub width: u32,
     pub height: u32,
     pub colorspace: ColorSpace,
-    pub component_count: usize,
     pub components: Vec<BatchComponentProfile>,
     pub quality: u8,
     pub format: OutputFormat,
@@ -116,13 +115,7 @@ impl BatchDecoder {
     }
 
     fn validate_or_set_profile(&mut self, image: &Image) -> Result<()> {
-        let profile = BatchProfile::from_image(
-            image,
-            &EncodeOptions {
-                quality: 0,
-                format: OutputFormat::Jp2,
-            },
-        );
+        let profile = BatchProfile::for_decode(image);
         match &self.profile {
             Some(expected) if !expected.same_image_profile(&profile) => {
                 Err(profile_mismatch(expected, &profile))
@@ -142,7 +135,6 @@ impl BatchProfile {
             width: image.width,
             height: image.height,
             colorspace: image.colorspace,
-            component_count: image.components.len(),
             components: image
                 .components
                 .iter()
@@ -153,11 +145,14 @@ impl BatchProfile {
         }
     }
 
+    fn for_decode(image: &Image) -> Self {
+        Self::from_image(image, &EncodeOptions { quality: 0, format: OutputFormat::Jp2 })
+    }
+
     fn same_image_profile(&self, other: &Self) -> bool {
         self.width == other.width
             && self.height == other.height
             && self.colorspace == other.colorspace
-            && self.component_count == other.component_count
             && self.components == other.components
     }
 }
@@ -191,19 +186,7 @@ where
 
 fn profile_mismatch(expected: &BatchProfile, found: &BatchProfile) -> Jp2LamError {
     Jp2LamError::InvalidInput(format!(
-        "batch item profile mismatch: expected {}x{} {:?} {} components q{} {:?}, found {}x{} {:?} {} components q{} {:?}",
-        expected.width,
-        expected.height,
-        expected.colorspace,
-        expected.component_count,
-        expected.quality,
-        expected.format,
-        found.width,
-        found.height,
-        found.colorspace,
-        found.component_count,
-        found.quality,
-        found.format
+        "batch item profile mismatch: expected {expected:?}, found {found:?}"
     ))
 }
 

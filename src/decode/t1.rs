@@ -465,12 +465,8 @@ fn decode_new_significant(
     flags.mark_significant(x, y, sign_bit);
 }
 
-fn clear_visited_all(flags: &mut FlagGrid, width: usize, height: usize) {
-    for y in 0..height {
-        for x in 0..width {
-            flags.clear_visited(x, y);
-        }
-    }
+fn clear_visited_all(flags: &mut FlagGrid, _width: usize, _height: usize) {
+    flags.clear_visited_all();
 }
 
 fn copy_block_to_tile(

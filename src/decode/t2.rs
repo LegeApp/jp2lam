@@ -78,6 +78,7 @@ pub(crate) fn parse_tile_part_payload<'a>(
 ) -> Result<DecodedTilePackets<'a>> {
     validate_packet_scope(header)?;
     let mut bands = build_band_states(header)?;
+    let band_lookup = build_band_lookup(&bands, header.siz.components.len(), header.cod.decomposition_levels);
     let mut pos = 0usize;
     let mut packets = Vec::new();
     let mut codeblocks = Vec::new();
@@ -95,7 +96,7 @@ pub(crate) fn parse_tile_part_payload<'a>(
                 let mut contributions = Vec::new();
 
                 if packet_present {
-                    for band_index in bands_for_component_resolution(&bands, component, resolution) {
+                    for &band_index in &band_lookup[component][resolution as usize] {
                         read_band_contributions(
                             &mut bio,
                             layer,
@@ -254,18 +255,13 @@ fn read_band_contributions(
     Ok(())
 }
 
-fn bands_for_component_resolution(
-    bands: &[BandState],
-    component: usize,
-    resolution: u8,
-) -> Vec<usize> {
-    bands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, band)| {
-            (band.component == component && band.resolution == resolution).then_some(index)
-        })
-        .collect()
+fn build_band_lookup(bands: &[BandState], component_count: usize, levels: u8) -> Vec<Vec<Vec<usize>>> {
+    let res_count = usize::from(levels) + 1;
+    let mut lookup = vec![vec![Vec::new(); res_count]; component_count];
+    for (index, band) in bands.iter().enumerate() {
+        lookup[band.component][band.resolution as usize].push(index);
+    }
+    lookup
 }
 
 fn build_band_states(header: &CodestreamHeader) -> Result<Vec<BandState>> {
