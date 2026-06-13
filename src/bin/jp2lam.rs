@@ -81,7 +81,14 @@ fn run_encode(input_path: PathBuf, quality: Option<u8>) -> Result<(), String> {
     let decoded = image::open(&input_path)
         .map_err(|err| format!("failed to open input image: {err}"))?;
     let image = to_jp2lam_image(decoded)?;
-    let quality = quality.unwrap_or_else(|| default_quality(image.colorspace));
+    // No explicit quality: pick it from the image's content class (photo vs graphics).
+    let (quality, auto_note) = match quality {
+        Some(q) => (q, String::new()),
+        None => {
+            let (class, q) = jp2lam::content::auto_class_and_quality(&image);
+            (q, format!(" (auto: {})", class.label()))
+        }
+    };
 
     let options = EncodeOptions {
         quality,
@@ -105,7 +112,7 @@ fn run_encode(input_path: PathBuf, quality: Option<u8>) -> Result<(), String> {
     fs::write(&output_path, encoded)
         .map_err(|err| format!("failed to write output file: {err}"))?;
 
-    println!("quality={quality} output={}", output_path.display());
+    println!("quality={quality}{auto_note} output={}", output_path.display());
     Ok(())
 }
 
@@ -128,12 +135,14 @@ fn run_encode_dir(
     fs::create_dir_all(&output_dir)
         .map_err(|err| format!("failed to create output directory: {err}"))?;
 
+    // One quality applies to the whole batch (BatchEncoder pins it into its profile).
+    // With no explicit quality, derive it from the first image's content class.
     let quality = if let Some(q) = quality {
         q
     } else {
         let first = image::open(&files[0])
             .map_err(|err| format!("failed to open input image {}: {err}", files[0].display()))?;
-        default_quality(to_jp2lam_image(first)?.colorspace)
+        jp2lam::content::auto_quality(&to_jp2lam_image(first)?)
     };
     let options = EncodeOptions {
         quality,
@@ -485,13 +494,6 @@ fn file_stem(path: &Path) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("image")
         .to_string()
-}
-
-fn default_quality(colorspace: ColorSpace) -> u8 {
-    match colorspace {
-        ColorSpace::Gray => 85,
-        _ => 62,
-    }
 }
 
 fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
