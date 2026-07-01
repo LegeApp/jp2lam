@@ -11,6 +11,7 @@ mod mq;
 mod perceptual;
 mod plan;
 mod profile;
+mod simd;
 mod t2;
 mod tier1;
 mod tiling;

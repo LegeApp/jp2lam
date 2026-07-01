@@ -1,14 +1,16 @@
 use super::{layout, rate, t1, t2};
 use crate::dwt::norms::{band_gain, reversible_exponent};
 use crate::dwt::pcrd::select_for_quality;
-use crate::dwt::{forward_53_2d_in_place, forward_97_2d_in_place};
 use crate::encode::backend::CodestreamBackend;
 use crate::encode::context::EncodeContext;
 use crate::encode::profile_enter;
 use crate::error::{Jp2LamError, Result};
-use crate::j2k::{build_main_header_segments, CodestreamParts, TilePart, TilePartHeader};
-use crate::perceptual::{build_contrast_mask_map_from_luma_u8, ContrastMaskMap, ContrastMaskParams};
+use crate::j2k::{CodestreamParts, TilePart, TilePartHeader, build_main_header_segments};
+use crate::perceptual::{
+    ContrastMaskMap, ContrastMaskParams, build_contrast_mask_map_from_luma_u8,
+};
 use crate::plan::{EncodeLane, EncodingPlan, QuantizationStyle, SubbandQuant, WaveletTransform};
+use crate::simd::PRIMITIVES;
 
 pub(crate) struct NativeBackend;
 
@@ -59,7 +61,7 @@ impl NativeBackend {
         let height = context.plan.height as usize;
         let levels = context.plan.decomposition_levels;
 
-        forward_97_2d_in_place(&mut data, width, height, levels)?;
+        (PRIMITIVES.dwt.forward_97_2d)(&mut data, width, height, levels)?;
 
         let precision = context
             .plan
@@ -98,7 +100,7 @@ impl NativeBackend {
         let width = context.plan.width as usize;
         let height = context.plan.height as usize;
         let levels = context.plan.decomposition_levels;
-        forward_97_2d_in_place(&mut data, width, height, levels)?;
+        (PRIMITIVES.dwt.forward_97_2d)(&mut data, width, height, levels)?;
         Ok(data)
     }
 
@@ -130,7 +132,7 @@ impl NativeBackend {
 
         let mut data = reversible_input_component(context, component_index)?;
 
-        forward_53_2d_in_place(
+        (PRIMITIVES.dwt.forward_53_2d)(
             &mut data,
             context.plan.width as usize,
             context.plan.height as usize,
@@ -318,7 +320,12 @@ impl NativeBackend {
 
         let width = context.plan.width as usize;
         let height = context.plan.height as usize;
-        let precision = context.plan.components.first().map(|c| c.precision).unwrap_or(8);
+        let precision = context
+            .plan
+            .components
+            .first()
+            .map(|c| c.precision)
+            .unwrap_or(8);
         let levels = context.plan.decomposition_levels;
 
         // Re-run full PCRD pipeline to get the truncated pass selections.
@@ -357,7 +364,7 @@ impl NativeBackend {
                 }
             }
 
-            crate::dwt::inverse_97_2d_in_place(&mut dequant, width, height, levels);
+            (PRIMITIVES.dwt.inverse_97_2d)(&mut dequant, width, height, levels)?;
             reconstructed.push(dequant);
         }
 
@@ -434,10 +441,9 @@ fn irreversible_input_component(
         let source = context.component_data(component_index).ok_or_else(|| {
             Jp2LamError::EncodeFailed(format!("missing component {component_index} samples"))
         })?;
-        return Ok(source
-            .iter()
-            .map(|&sample| (sample - (1 << 7)) as f32)
-            .collect());
+        let mut out = vec![0.0f32; source.len()];
+        (PRIMITIVES.color.level_shift_f32)(source, 1 << 7, &mut out);
+        return Ok(out);
     }
 
     if context.plan.component_count != 3 {
@@ -459,31 +465,13 @@ fn irreversible_input_component(
             "component sample lengths differ for irreversible MCT".to_string(),
         ));
     }
-    let mut out = Vec::with_capacity(r.len());
-    for i in 0..r.len() {
-        let rf = (r[i] - (1 << 7)) as f32;
-        let gf = (g[i] - (1 << 7)) as f32;
-        let bf = (b[i] - (1 << 7)) as f32;
-        let transformed = match component_index {
-            // Y = 0.299*R + 0.587*G + 0.114*B
-            // Note: Using explicit * to avoid operator precedence bugs with nested mul_add.
-            // The previous mul_add chain for Cb and Cr had parsing issues:
-            //   -0.168_75f32.mul_add(rf, -0.331_26f32.mul_add(gf, 0.5 * bf))
-            // was parsed as: -0.16875*rf + (-0.33126 * (gf + 0.5*bf))  WRONG!
-            // Should be: -0.16875*rf + (-0.33126*gf) + (0.5*bf) = -0.16875*rf - 0.33126*gf + 0.5*bf
-            0 => 0.299f32 * rf + 0.587f32 * gf + 0.114f32 * bf,
-            // Cb = -0.16875*R - 0.33126*G + 0.5*B
-            1 => -0.168_75f32 * rf + -0.331_26f32 * gf + 0.5f32 * bf,
-            // Cr = 0.5*R - 0.41869*G - 0.08131*B
-            2 => 0.5f32 * rf - 0.418_69f32 * gf - 0.081_31f32 * bf,
-            _ => {
-                return Err(Jp2LamError::EncodeFailed(format!(
-                    "irreversible MCT only supports component index 0..2, got {component_index}"
-                )));
-            }
-        };
-        out.push(transformed);
+    if component_index > 2 {
+        return Err(Jp2LamError::EncodeFailed(format!(
+            "irreversible MCT only supports component index 0..2, got {component_index}"
+        )));
     }
+    let mut out = vec![0.0f32; r.len()];
+    (PRIMITIVES.color.forward_ict_component)(r, g, b, component_index, 1 << 7, &mut out);
     Ok(out)
 }
 
@@ -495,7 +483,9 @@ fn reversible_input_component(
         let source = context.component_data(component_index).ok_or_else(|| {
             Jp2LamError::EncodeFailed(format!("missing component {component_index} samples"))
         })?;
-        return Ok(source.iter().map(|&s| s - (1 << 7)).collect());
+        let mut out = vec![0i32; source.len()];
+        (PRIMITIVES.color.level_shift_i32)(source, 1 << 7, &mut out);
+        return Ok(out);
     }
     if context.plan.component_count != 3 {
         return Err(Jp2LamError::EncodeFailed(
@@ -516,23 +506,13 @@ fn reversible_input_component(
             "component sample lengths differ for reversible MCT".to_string(),
         ));
     }
-    let mut out = Vec::with_capacity(r.len());
-    for i in 0..r.len() {
-        let rv = r[i] - (1 << 7);
-        let gv = g[i] - (1 << 7);
-        let bv = b[i] - (1 << 7);
-        let transformed = match component_index {
-            0 => (rv + 2 * gv + bv) >> 2,
-            1 => bv - gv,
-            2 => rv - gv,
-            _ => {
-                return Err(Jp2LamError::EncodeFailed(format!(
-                    "reversible MCT only supports component index 0..2, got {component_index}"
-                )));
-            }
-        };
-        out.push(transformed);
+    if component_index > 2 {
+        return Err(Jp2LamError::EncodeFailed(format!(
+            "reversible MCT only supports component index 0..2, got {component_index}"
+        )));
     }
+    let mut out = vec![0i32; r.len()];
+    (PRIMITIVES.color.forward_rct_component)(r, g, b, component_index, 1 << 7, &mut out);
     Ok(out)
 }
 
@@ -616,12 +596,7 @@ fn quantize_subband_rect(
     y1: usize,
     step: f32,
 ) {
-    for y in y0..y1 {
-        let row = y * stride;
-        for x in x0..x1 {
-            out[row + x] = quantize_f32_to_i32(data[row + x], step);
-        }
-    }
+    (PRIMITIVES.quant.quantize_f32_rect)(data, out, stride, x0, y0, x1, y1, step);
 }
 
 fn subband_quant_step(
@@ -642,16 +617,6 @@ fn subband_quant_step(
     let exponent = i32::from(quant.exponent);
     let base = 1.0 + f32::from(quant.mantissa) / 2048.0;
     Ok((base * 2f32.powi(numbps - exponent)).max(1e-6))
-}
-
-fn quantize_f32_to_i32(v: f32, step: f32) -> i32 {
-    if step <= 0.0 || !v.is_finite() {
-        return 0;
-    }
-    let q = (v / step).trunc();
-    // Clamp to i32 range; overflow here means a coefficient larger than ~2^31
-    // which cannot occur for reasonable inputs.
-    q.clamp(i32::MIN as f32, i32::MAX as f32) as i32
 }
 
 fn native_pcrd_enabled() -> bool {
@@ -692,7 +657,12 @@ fn apply_pcrd_selection(
         let taubman_weights: Option<Vec<f64>> = None;
         let component_weight = pcrd_component_weight(context, component_index);
 
-        let precision = context.plan.components.first().map(|c| c.precision).unwrap_or(8);
+        let precision = context
+            .plan
+            .components
+            .first()
+            .map(|c| c.precision)
+            .unwrap_or(8);
         let curves = rate::curves_from_tier1_layout(
             layout,
             context.plan.num_resolutions,
@@ -707,7 +677,7 @@ fn apply_pcrd_selection(
 
         let selection = select_for_quality(&curves, quality, pixel_count)
             .map_err(|err| Jp2LamError::EncodeFailed(err.to_string()))?;
-        
+
         let mut selected_passes = vec![0u16; curves.len()];
         for block in selection.selections {
             if let Some(slot) = selected_passes.get_mut(block.block_id) {
@@ -726,7 +696,9 @@ fn apply_pcrd_selection(
 fn pcrd_component_weight(context: &EncodeContext<'_>, component_index: usize) -> f64 {
     use crate::model::ColorSpace;
 
-    if !context.plan.use_mct || !matches!(context.image.colorspace.encoding_domain(), ColorSpace::Srgb) {
+    if !context.plan.use_mct
+        || !matches!(context.image.colorspace.encoding_domain(), ColorSpace::Srgb)
+    {
         return 1.0;
     }
 
@@ -938,8 +910,8 @@ fn native_use_mct(plan: &EncodingPlan) -> bool {
 /// Wang et al. (2004), constants from the standard formulation.
 fn mssim_8x8(orig: &[f32], recon: &[f32], width: usize, height: usize) -> f64 {
     const BLOCK: usize = 8;
-    const C1: f64 = 6.502_5;   // (0.01 * 255)^2
-    const C2: f64 = 58.522_5;  // (0.03 * 255)^2
+    const C1: f64 = 6.502_5; // (0.01 * 255)^2
+    const C2: f64 = 58.522_5; // (0.03 * 255)^2
 
     let block_rows = height / BLOCK;
     let block_cols = width / BLOCK;

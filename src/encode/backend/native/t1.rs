@@ -4,7 +4,8 @@ use crate::encode::counters;
 use crate::encode::profile_enter;
 use crate::mq::{MqCoder, T1_CTXNO_AGG, T1_CTXNO_UNI, T1_CTXNO_ZC};
 use crate::plan::BandOrientation;
-use crate::profile::{classify_from_nonzero_fraction, BlockClass};
+use crate::profile::{BlockClass, classify_from_nonzero_fraction};
+use crate::simd::PRIMITIVES;
 use crate::tier1::flags::FlagGrid;
 use crate::tier1::helpers::{
     magnitude_context, sign_context, sign_prediction_bit, zero_coding_context,
@@ -20,7 +21,7 @@ pub(crate) fn band_max_bitplanes(precision: u32, guard_bits: u8, band: BandOrien
     guard_bits.saturating_sub(1).saturating_add(expn)
 }
 
-use super::layout::{NativeCodeBlock, NativeComponentLayout, NativeSubband};
+use super::layout::{NativeCodeBlock, NativeComponentLayout};
 
 // ---------------------------------------------------------------------------
 // Public data types (unchanged)
@@ -169,18 +170,36 @@ pub(crate) fn analyze_component_layout_with_max_bitplanes<F>(
 where
     F: FnMut(u8, BandOrientation) -> u8,
 {
-    NativeTier1Layout {
-        bands: layout
-            .subbands
-            .iter()
-            .map(|subband| {
-                analyze_subband_with_mb(
-                    subband,
-                    max_bitplanes_for_subband(subband.resolution, subband.band),
-                )
-            })
-            .collect(),
+    let mut bands = Vec::with_capacity(layout.subbands.len());
+    let mut jobs = Vec::new();
+
+    for (band_index, subband) in layout.subbands.iter().enumerate() {
+        let mb = max_bitplanes_for_subband(subband.resolution, subband.band);
+        bands.push(NativeTier1Band {
+            resolution: subband.resolution,
+            band: subband.band,
+            blocks: Vec::with_capacity(subband.codeblocks.len()),
+        });
+        jobs.extend(
+            subband
+                .codeblocks
+                .iter()
+                .map(|block| (band_index, subband.resolution, subband.band, mb, block)),
+        );
     }
+
+    let analyzed: Vec<_> = jobs
+        .par_iter()
+        .map(|&(band_index, resolution, band, mb, block)| {
+            (band_index, analyze_codeblock(resolution, band, mb, block))
+        })
+        .collect();
+
+    for (band_index, block) in analyzed {
+        bands[band_index].blocks.push(block);
+    }
+
+    NativeTier1Layout { bands }
 }
 
 pub(crate) fn analyze_component_layout_with(
@@ -193,20 +212,6 @@ pub(crate) fn analyze_component_layout_with(
     })
 }
 
-fn analyze_subband_with_mb(subband: &NativeSubband, mb: u8) -> NativeTier1Band {
-    let blocks = subband
-        .codeblocks
-        .par_iter()
-        .map(|block| analyze_codeblock(subband.resolution, subband.band, mb, block))
-        .collect();
-
-    NativeTier1Band {
-        resolution: subband.resolution,
-        band: subband.band,
-        blocks,
-    }
-}
-
 fn analyze_codeblock(
     resolution: u8,
     band: BandOrientation,
@@ -215,18 +220,11 @@ fn analyze_codeblock(
 ) -> NativeTier1CodeBlock {
     let width = block.x1 - block.x0;
     let height = block.y1 - block.y0;
-    
-    // Fuse max_magnitude and nonzero_count into a single scan
-    let (max_magnitude, nonzero_count) = block
-        .coefficients
-        .iter()
-        .fold((0u32, 0usize), |(max_mag, nonzero), &value| {
-            let mag = value.unsigned_abs();
-            let new_max = max_mag.max(mag);
-            let new_nonzero = if value != 0 { nonzero + 1 } else { nonzero };
-            (new_max, new_nonzero)
-        });
-    
+
+    // Fuse max_magnitude and nonzero_count into a single primitive scan.
+    let (max_magnitude, nonzero_count) =
+        (PRIMITIVES.analyze.i32_max_magnitude_and_nnz)(&block.coefficients);
+
     let magnitude_bitplanes = if max_magnitude == 0 {
         0
     } else {
@@ -265,21 +263,37 @@ fn analyze_codeblock(
 
 pub(crate) fn encode_placeholder_tier1(layout: &NativeTier1Layout) -> NativeEncodedTier1Layout {
     let _p = profile_enter("t1::encode_placeholder_tier1");
-    
+
     // Count bands first for statistics
     #[cfg(feature = "counters")]
     {
         let band_count: usize = layout.bands.iter().map(|b| b.blocks.len()).sum();
         counters::TOTAL_BLOCKS.fetch_add(band_count as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    
-    NativeEncodedTier1Layout {
-        bands: layout
-            .bands
-            .iter()
-            .map(|band| encode_band_with_policy(band, &NativeTier1CodingPolicy::default()))
-            .collect(),
+
+    let policy = NativeTier1CodingPolicy::default();
+    let mut bands = Vec::with_capacity(layout.bands.len());
+    let mut jobs = Vec::new();
+
+    for (band_index, band) in layout.bands.iter().enumerate() {
+        bands.push(NativeEncodedTier1Band {
+            resolution: band.resolution,
+            band: band.band,
+            blocks: Vec::with_capacity(band.blocks.len()),
+        });
+        jobs.extend(band.blocks.iter().map(|block| (band_index, block)));
     }
+
+    let encoded: Vec<_> = jobs
+        .par_iter()
+        .map(|&(band_index, block)| (band_index, encode_codeblock_with_policy(block, &policy)))
+        .collect();
+
+    for (band_index, block) in encoded {
+        bands[band_index].blocks.push(block);
+    }
+
+    NativeEncodedTier1Layout { bands }
 }
 
 fn encode_band_with_policy(
@@ -497,14 +511,22 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
     let mut coder = MqCoder::with_capacity(estimated_capacity);
     let mut flags = FlagGrid::new(block.width, block.height);
     // (kind, bitplane, newly_significant, snapshot_after, significant_before, mse_numerator)
-    let mut metas: Vec<(NativeTier1PassKind, u8, usize, usize, usize, f64)> = Vec::with_capacity(block.coding_passes.len());
+    let mut metas: Vec<(NativeTier1PassKind, u8, usize, usize, usize, f64)> =
+        Vec::with_capacity(block.coding_passes.len());
     let mut significant_so_far = 0usize;
 
     let top = block.magnitude_bitplanes - 1;
 
     // Most-significant bitplane: cleanup only, no SP/MR.
     let (ns, cl_mse) = cleanup_encode(&mut coder, block, top, &mut flags);
-    metas.push((NativeTier1PassKind::Cleanup, top, ns, coder.numbytes(), 0, cl_mse));
+    metas.push((
+        NativeTier1PassKind::Cleanup,
+        top,
+        ns,
+        coder.numbytes(),
+        0,
+        cl_mse,
+    ));
     significant_so_far += ns;
     clear_visited_all(&mut flags, block.width, block.height);
 
@@ -545,7 +567,14 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
         ));
 
         let (cl_ns, cl_mse) = cleanup_encode(&mut coder, block, bitplane, &mut flags);
-        metas.push((NativeTier1PassKind::Cleanup, bitplane, cl_ns, coder.numbytes(), significant_so_far, cl_mse));
+        metas.push((
+            NativeTier1PassKind::Cleanup,
+            bitplane,
+            cl_ns,
+            coder.numbytes(),
+            significant_so_far,
+            cl_mse,
+        ));
         significant_so_far += cl_ns;
 
         clear_visited_all(&mut flags, block.width, block.height);
@@ -593,8 +622,8 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
             mse_numerator: mse,
             bytes,
         });
-        
-#[cfg(feature = "counters")]
+
+        #[cfg(feature = "counters")]
         {
             #[allow(unreachable_patterns)]
             match kind {
@@ -609,10 +638,11 @@ fn encode_codeblock_single_term(block: &NativeTier1CodeBlock) -> NativeEncodedTi
                 }
                 _ => {}
             }
-            counters::TOTAL_PASS_BYTES.fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
+            counters::TOTAL_PASS_BYTES
+                .fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    
+
     NativeEncodedTier1CodeBlock {
         resolution: block.resolution,
         band: block.band,
@@ -644,7 +674,7 @@ fn append_pass(
 ) {
     let length = bytes.len();
     *cumulative_length += length;
-    
+
     // Count passes
     #[cfg(feature = "counters")]
     {
@@ -663,7 +693,7 @@ fn append_pass(
         }
         counters::TOTAL_PASS_BYTES.fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
     passes.push(NativeEncodedTier1Pass {
         kind,
         bitplane,
@@ -792,7 +822,18 @@ fn sigpass_encode(
         for x in 0..w {
             for ci in 0..4usize {
                 let y = k + ci;
-                sigpass_step(coder, block, x, y, w, one, flags, &mut newly_significant, &mut mse_num, mode);
+                sigpass_step(
+                    coder,
+                    block,
+                    x,
+                    y,
+                    w,
+                    one,
+                    flags,
+                    &mut newly_significant,
+                    &mut mse_num,
+                    mode,
+                );
             }
         }
     }
@@ -801,7 +842,18 @@ fn sigpass_encode(
         for x in 0..w {
             for ci in 0..rem {
                 let y = k + ci;
-                sigpass_step(coder, block, x, y, w, one, flags, &mut newly_significant, &mut mse_num, mode);
+                sigpass_step(
+                    coder,
+                    block,
+                    x,
+                    y,
+                    w,
+                    one,
+                    flags,
+                    &mut newly_significant,
+                    &mut mse_num,
+                    mode,
+                );
             }
         }
     }
@@ -939,14 +991,34 @@ fn cleanup_encode(
 
     for k in (0..full_stripes * 4).step_by(4) {
         for x in 0..w {
-            cleanup_stripe(coder, block, x, k, 4, one, flags, &mut newly_significant, &mut mse_num);
+            cleanup_stripe(
+                coder,
+                block,
+                x,
+                k,
+                4,
+                one,
+                flags,
+                &mut newly_significant,
+                &mut mse_num,
+            );
         }
     }
     if rem > 0 {
         let k = full_stripes * 4;
         for x in 0..w {
             // Partial stripes never use AGG (spec §C.3.2); use regular per-sample coding.
-            cleanup_stripe_partial(coder, block, x, k, rem, one, flags, &mut newly_significant, &mut mse_num);
+            cleanup_stripe_partial(
+                coder,
+                block,
+                x,
+                k,
+                rem,
+                one,
+                flags,
+                &mut newly_significant,
+                &mut mse_num,
+            );
         }
     }
 
@@ -1004,7 +1076,17 @@ fn cleanup_stripe(
             // Regular ZC coding for samples after the run-length position.
             for ci in (rl + 1)..lim {
                 let y = k + ci;
-                cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, mse_num, w);
+                cleanup_sample_regular(
+                    coder,
+                    block,
+                    x,
+                    y,
+                    one,
+                    flags,
+                    newly_significant,
+                    mse_num,
+                    w,
+                );
             }
         } else {
             // All 4 samples are insignificant at this bitplane: encode runlen=4.
@@ -1019,7 +1101,17 @@ fn cleanup_stripe(
         // Regular per-sample coding.
         for ci in 0..lim {
             let y = k + ci;
-            cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, mse_num, w);
+            cleanup_sample_regular(
+                coder,
+                block,
+                x,
+                y,
+                one,
+                flags,
+                newly_significant,
+                mse_num,
+                w,
+            );
         }
     }
 }
@@ -1039,7 +1131,17 @@ fn cleanup_stripe_partial(
     let w = block.width;
     for ci in 0..lim {
         let y = k + ci;
-        cleanup_sample_regular(coder, block, x, y, one, flags, newly_significant, mse_num, w);
+        cleanup_sample_regular(
+            coder,
+            block,
+            x,
+            y,
+            one,
+            flags,
+            newly_significant,
+            mse_num,
+            w,
+        );
     }
 }
 
@@ -1226,12 +1328,12 @@ fn plan_coding_passes(coefficients: &[i32], magnitude_bitplanes: u8) -> Vec<Nati
 #[cfg(test)]
 mod tests {
     use super::{
-        analyze_component_layout, encode_band_with_policy, encode_placeholder_tier1,
         NativeTier1CodingPolicy, NativeTier1Layout, NativeTier1PassCodingMode, NativeTier1PassKind,
-        NativeTier1PassTermination,
+        NativeTier1PassTermination, analyze_component_layout, encode_band_with_policy,
+        encode_placeholder_tier1,
     };
-    use crate::encode::backend::native::layout::build_component_layout;
     use crate::encode::backend::native::NativeComponentCoefficients;
+    use crate::encode::backend::native::layout::build_component_layout;
     use crate::plan::{BandOrientation, CodeBlockSize};
 
     #[test]
@@ -1397,12 +1499,7 @@ mod tests {
             width: 4,
             height: 4,
             levels: 2,
-            data: vec![
-                -38, 36, 0, 16,
-                144, 0, 0, 16,
-                0, 0, 0, 0,
-                64, 64, 0, 0,
-            ],
+            data: vec![-38, 36, 0, 16, 144, 0, 0, 16, 0, 0, 0, 0, 64, 64, 0, 0],
         };
         let layout = build_component_layout(
             &coefficients,
@@ -1532,9 +1629,11 @@ mod tests {
 
         assert!(!cleanup_termall.is_empty());
         assert_eq!(cleanup_termall.len(), cleanup_erterm.len());
-        assert!(cleanup_erterm
-            .iter()
-            .all(|pass| pass.termination == NativeTier1PassTermination::ErTerm));
+        assert!(
+            cleanup_erterm
+                .iter()
+                .all(|pass| pass.termination == NativeTier1PassTermination::ErTerm)
+        );
         assert!(
             cleanup_termall
                 .iter()
@@ -1674,9 +1773,11 @@ mod tests {
             .collect();
 
         assert!(!lower_raw.is_empty());
-        assert!(lower_raw
-            .iter()
-            .all(|pass| pass.coding_mode == NativeTier1PassCodingMode::Raw));
+        assert!(
+            lower_raw
+                .iter()
+                .all(|pass| pass.coding_mode == NativeTier1PassCodingMode::Raw)
+        );
         assert!(
             lower_mq
                 .iter()

@@ -1,6 +1,5 @@
 //! Coefficient reconstruction, inverse DWT, and color transform for the decoder.
 
-use crate::dwt::{inverse_53_2d_in_place, inverse_97_2d_in_place};
 use crate::dwt::norms::band_gain;
 use crate::error::{Jp2LamError, Result};
 use crate::j2k::decode_markers::{
@@ -8,6 +7,7 @@ use crate::j2k::decode_markers::{
 };
 use crate::model::{ColorSpace, Component, Image};
 use crate::plan::BandOrientation;
+use crate::simd::PRIMITIVES;
 
 use super::t1::DecodedTileCoefficients;
 
@@ -49,12 +49,14 @@ pub(crate) fn reconstruct_grayscale_image(
         .components
         .first()
         .ok_or_else(|| invalid("missing decoded component header"))?;
-    let width = usize::try_from(header.siz.width)
-        .map_err(|_| invalid("decoded width exceeds usize"))?;
-    let height = usize::try_from(header.siz.height)
-        .map_err(|_| invalid("decoded height exceeds usize"))?;
+    let width =
+        usize::try_from(header.siz.width).map_err(|_| invalid("decoded width exceeds usize"))?;
+    let height =
+        usize::try_from(header.siz.height).map_err(|_| invalid("decoded height exceeds usize"))?;
     if tile.component != 0 || tile.width != width || tile.height != height {
-        return Err(invalid("decoded coefficient tile dimensions do not match SIZ"));
+        return Err(invalid(
+            "decoded coefficient tile dimensions do not match SIZ",
+        ));
     }
 
     let samples = match header.cod.transform {
@@ -101,7 +103,10 @@ fn reconstruct_srgb_image(
         WaveletTransform::Reversible53 => {
             let mut planes = Vec::with_capacity(3);
             for tile in tiles {
-                planes.push(reconstruct_reversible_53_centered(header, tile.coefficients)?);
+                planes.push(reconstruct_reversible_53_centered(
+                    header,
+                    tile.coefficients,
+                )?);
             }
             if header.cod.use_mct {
                 inverse_rct_centered(&mut planes)?;
@@ -159,9 +164,11 @@ fn reconstruct_reversible_53_centered(
     mut coefficients: Vec<i32>,
 ) -> Result<Vec<i32>> {
     if header.qcd.style != QuantizationStyle::NoQuantization {
-        return Err(invalid("reversible 5/3 reconstruction expects no quantization"));
+        return Err(invalid(
+            "reversible 5/3 reconstruction expects no quantization",
+        ));
     }
-    inverse_53_2d_in_place(
+    (PRIMITIVES.dwt.inverse_53_2d)(
         &mut coefficients,
         header.siz.width as usize,
         header.siz.height as usize,
@@ -177,17 +184,7 @@ fn inverse_ict_centered(planes: &mut [Vec<f32>]) -> Result<()> {
     if y.len() != cb.len() || y.len() != cr.len() {
         return Err(invalid("ICT component lengths differ"));
     }
-    for i in 0..y.len() {
-        let yy = y[i];
-        let cbb = cb[i];
-        let crr = cr[i];
-        let r = yy + 1.402f32 * crr;
-        let g = yy - 0.344_13f32 * cbb - 0.714_14f32 * crr;
-        let b = yy + 1.772f32 * cbb;
-        y[i] = r;
-        cb[i] = g;
-        cr[i] = b;
-    }
+    (PRIMITIVES.color.inverse_ict)(y, cb, cr);
     Ok(())
 }
 
@@ -198,17 +195,7 @@ fn inverse_rct_centered(planes: &mut [Vec<i32>]) -> Result<()> {
     if y.len() != db.len() || y.len() != dr.len() {
         return Err(invalid("RCT component lengths differ"));
     }
-    for i in 0..y.len() {
-        let yy = y[i];
-        let dbv = db[i];
-        let drv = dr[i];
-        let g = yy - ((dbv + drv) >> 2);
-        let r = drv + g;
-        let b = dbv + g;
-        y[i] = r;
-        db[i] = g;
-        dr[i] = b;
-    }
+    (PRIMITIVES.color.inverse_rct)(y, db, dr);
     Ok(())
 }
 
@@ -238,43 +225,27 @@ fn reconstruct_irreversible_97_centered(
         dequantize_rect(&coefficients, &mut data, width, rect, step);
     }
 
-    inverse_97_2d_in_place(
-        &mut data,
-        width,
-        height,
-        header.cod.decomposition_levels,
-    );
+    (PRIMITIVES.dwt.inverse_97_2d)(&mut data, width, height, header.cod.decomposition_levels)?;
 
     Ok(data)
 }
 
 fn finalize_i32_samples(samples: Vec<i32>) -> Vec<i32> {
-    samples
-        .into_iter()
-        .map(|sample| (sample + 128).clamp(0, 255))
-        .collect()
+    let mut out = vec![0; samples.len()];
+    (PRIMITIVES.color.finalize_i32)(&samples, &mut out);
+    out
 }
 
 fn finalize_f32_samples(samples: Vec<f32>) -> Vec<i32> {
-    samples
-        .into_iter()
-        .map(|sample| (sample + 128.0).round().clamp(0.0, 255.0) as i32)
-        .collect()
+    let mut out = vec![0; samples.len()];
+    (PRIMITIVES.color.finalize_f32)(&samples, &mut out);
+    out
 }
 
 fn dequantize_rect(input: &[i32], output: &mut [f32], stride: usize, rect: SubbandRect, step: f32) {
-    for y in rect.y0..rect.y1 {
-        let row = y * stride;
-        for x in rect.x0..rect.x1 {
-            let q = input[row + x];
-            output[row + x] = if q == 0 {
-                0.0
-            } else {
-                let sign = if q >= 0 { 1.0 } else { -1.0 };
-                sign * (q.unsigned_abs() as f32 + 0.5) * step
-            };
-        }
-    }
+    (PRIMITIVES.quant.dequantize_i32_rect)(
+        input, output, stride, rect.x0, rect.y0, rect.x1, rect.y1, step,
+    );
 }
 
 fn quant_step(precision: u32, band: BandOrientation, quant: QuantizationStep) -> f32 {
@@ -360,7 +331,10 @@ mod tests {
 
         assert_eq!(finalize_f32_samples(planes.remove(0)), vec![85]);
         assert_eq!(finalize_f32_samples(planes.remove(0)), vec![122]);
-        assert_eq!(finalize_f32_samples(planes.remove(0)), vec![270_i32.clamp(0, 255)]);
+        assert_eq!(
+            finalize_f32_samples(planes.remove(0)),
+            vec![270_i32.clamp(0, 255)]
+        );
     }
 
     #[test]

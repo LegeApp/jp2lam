@@ -2,12 +2,41 @@
 
 use crate::encode::profile_enter;
 use crate::error::{Jp2LamError, Result};
+use rayon::prelude::*;
+#[cfg(feature = "simd")]
+use wide::i32x8;
+
+// Disabled by default — see the matching constant in `dwt::irrev97` for why:
+// both a snapshot-copy and a zero-copy version of this parallelism measured
+// as net regressions on real images. Kept and directly unit-tested (see
+// `dwt::rev53::tests`) for a future lower-overhead attempt.
+const PARALLEL_COLUMN_THRESHOLD: usize = usize::MAX / 2;
 
 pub(crate) fn forward_53_2d_in_place(
     data: &mut [i32],
     width: usize,
     height: usize,
     levels: u8,
+) -> Result<()> {
+    forward_53_2d_in_place_impl(data, width, height, levels, false)
+}
+
+#[cfg(feature = "simd")]
+pub(crate) fn forward_53_2d_in_place_wide(
+    data: &mut [i32],
+    width: usize,
+    height: usize,
+    levels: u8,
+) -> Result<()> {
+    forward_53_2d_in_place_impl(data, width, height, levels, true)
+}
+
+fn forward_53_2d_in_place_impl(
+    data: &mut [i32],
+    width: usize,
+    height: usize,
+    levels: u8,
+    use_wide: bool,
 ) -> Result<()> {
     let _p = profile_enter("dwt::forward_53_2d_in_place");
     let expected_len = width
@@ -25,18 +54,20 @@ pub(crate) fn forward_53_2d_in_place(
 
     let resolutions = encode_resolutions(width, height, levels);
     let max_span = width.max(height);
-    let mut scratch = vec![0i32; max_span];
+    let mut work = vec![0i32; max_span * 3];
+    let mut vertical = vec![0i32; width * height];
 
     for &(rw, rh) in resolutions.iter().skip(1).rev() {
-        for x in 0..rw {
-            gather_column(data, width, rh, x, &mut scratch[..rh]);
-            forward_53_1d_in_place(&mut scratch[..rh], true);
-            scatter_column(data, width, rh, x, &scratch[..rh]);
-        }
+        forward_53_vertical_even_in_place(data, width, rw, rh, &mut vertical, use_wide);
 
         for y in 0..rh {
             let row_start = y * width;
-            forward_53_1d_in_place(&mut data[row_start..row_start + rw], true);
+            forward_53_1d_with_scratch(
+                &mut data[row_start..row_start + rw],
+                true,
+                &mut work[..rw],
+                use_wide,
+            );
         }
     }
 
@@ -48,6 +79,26 @@ pub(crate) fn inverse_53_2d_in_place(
     width: usize,
     height: usize,
     levels: u8,
+) -> Result<()> {
+    inverse_53_2d_in_place_impl(data, width, height, levels, false)
+}
+
+#[cfg(feature = "simd")]
+pub(crate) fn inverse_53_2d_in_place_wide(
+    data: &mut [i32],
+    width: usize,
+    height: usize,
+    levels: u8,
+) -> Result<()> {
+    inverse_53_2d_in_place_impl(data, width, height, levels, true)
+}
+
+fn inverse_53_2d_in_place_impl(
+    data: &mut [i32],
+    width: usize,
+    height: usize,
+    levels: u8,
+    use_wide: bool,
 ) -> Result<()> {
     let _p = profile_enter("dwt::inverse_53_2d_in_place");
     let expected_len = width
@@ -65,25 +116,36 @@ pub(crate) fn inverse_53_2d_in_place(
 
     let resolutions = encode_resolutions(width, height, levels);
     let max_span = width.max(height);
-    let mut scratch = vec![0i32; max_span];
+    let mut work = vec![0i32; max_span * 3];
+    let mut vertical = vec![0i32; width * height];
 
     for &(rw, rh) in resolutions.iter().skip(1) {
         for y in 0..rh {
             let row_start = y * width;
-            inverse_53_1d_even_in_place(&mut data[row_start..row_start + rw]);
+            inverse_53_1d_even_with_scratch(
+                &mut data[row_start..row_start + rw],
+                &mut work[..rw * 3],
+                use_wide,
+            );
         }
 
-        for x in 0..rw {
-            gather_column(data, width, rh, x, &mut scratch[..rh]);
-            inverse_53_1d_even_in_place(&mut scratch[..rh]);
-            scatter_column(data, width, rh, x, &scratch[..rh]);
-        }
+        inverse_53_vertical_even_in_place(data, width, rw, rh, &mut vertical, use_wide);
     }
 
     Ok(())
 }
 
 fn forward_53_1d_in_place(samples: &mut [i32], even: bool) {
+    let mut scratch = vec![0i32; samples.len()];
+    forward_53_1d_with_scratch(samples, even, &mut scratch, false);
+}
+
+fn forward_53_1d_with_scratch(
+    samples: &mut [i32],
+    even: bool,
+    scratch: &mut [i32],
+    use_wide: bool,
+) {
     let width = samples.len();
     if width <= 1 {
         if !even && width == 1 {
@@ -94,56 +156,120 @@ fn forward_53_1d_in_place(samples: &mut [i32], even: bool) {
 
     let sn = (width + if even { 1 } else { 0 }) >> 1;
     let dn = width - sn;
+    let scratch = &mut scratch[..width];
     if even {
-        let mut low = Vec::with_capacity(sn);
-        let mut high = Vec::with_capacity(dn);
+        for value in scratch.iter_mut() {
+            *value = 0;
+        }
         for (index, &sample) in samples.iter().enumerate() {
             if index.is_multiple_of(2) {
-                low.push(sample);
+                scratch[index / 2] = sample;
             } else {
-                high.push(sample);
+                scratch[sn + index / 2] = sample;
             }
         }
 
-        // Reversible 5/3 predict step on odd samples.
-        for i in 0..dn {
-            let left = low[i];
-            let right = low[(i + 1).min(sn - 1)];
-            high[i] -= (left + right) >> 1;
-        }
+        // Reversible 5/3 predict step on odd samples:
+        // scratch[sn+i] -= (scratch[i] + scratch[(i+1).min(sn-1)]) >> 1, for i in 0..dn.
+        forward_predict_horizontal(scratch, sn, dn, use_wide);
 
-        // Reversible 5/3 update step on even samples.
-        for i in 0..sn {
-            let left = high[i.saturating_sub(1).min(dn - 1)];
-            let right = high[i.min(dn - 1)];
-            low[i] += (left + right + 2) >> 2;
-        }
+        // Reversible 5/3 update step on even samples:
+        // scratch[i] += (scratch[sn+i.saturating_sub(1).min(dn-1)] + scratch[sn+i.min(dn-1)] + 2) >> 2, for i in 0..sn.
+        forward_update_horizontal(scratch, sn, dn, use_wide);
 
-        samples[..sn].copy_from_slice(&low);
-        samples[sn..sn + dn].copy_from_slice(&high);
+        samples.copy_from_slice(scratch);
     } else {
-        let mut tmp = vec![0i32; width];
-        tmp[sn] = samples[0] - samples[1];
+        scratch[sn] = samples[0] - samples[1];
         for i in 1..sn {
-            tmp[sn + i] = samples[2 * i] - ((samples[2 * i + 1] + samples[2 * (i - 1) + 1]) >> 1);
+            scratch[sn + i] =
+                samples[2 * i] - ((samples[2 * i + 1] + samples[2 * (i - 1) + 1]) >> 1);
         }
         if !width.is_multiple_of(2) {
             let i = sn;
-            tmp[sn + i] = samples[2 * i] - samples[2 * (i - 1) + 1];
+            scratch[sn + i] = samples[2 * i] - samples[2 * (i - 1) + 1];
         }
 
         for i in 0..dn.saturating_sub(1) {
-            samples[i] = samples[2 * i + 1] + ((tmp[sn + i] + tmp[sn + i + 1] + 2) >> 2);
+            samples[i] = samples[2 * i + 1] + ((scratch[sn + i] + scratch[sn + i + 1] + 2) >> 2);
         }
         if width.is_multiple_of(2) {
             let i = dn - 1;
-            samples[i] = samples[2 * i + 1] + ((tmp[sn + i] + tmp[sn + i] + 2) >> 2);
+            samples[i] = samples[2 * i + 1] + ((scratch[sn + i] + scratch[sn + i] + 2) >> 2);
         }
-        samples[sn..sn + dn].copy_from_slice(&tmp[sn..sn + dn]);
+        samples[sn..sn + dn].copy_from_slice(&scratch[sn..sn + dn]);
+    }
+}
+
+/// `scratch[sn+i] -= (scratch[i] + scratch[(i+1).min(sn-1)]) >> 1`, for `i in 0..dn`.
+/// The low (`0..sn`) and high (`sn..sn+dn`) regions of `scratch` never overlap,
+/// so the vector loop below is a plain read-then-write with no aliasing.
+#[inline]
+fn forward_predict_horizontal(scratch: &mut [i32], sn: usize, dn: usize, use_wide: bool) {
+    let mut i = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        // Interior where `i+1 < sn`, i.e. `right` reads unclamped.
+        let safe_len = dn.min(sn.saturating_sub(1));
+        while i + 8 <= safe_len {
+            let left = i32x8::new(scratch[i..i + 8].try_into().expect("8 lanes"));
+            let right = i32x8::new(scratch[i + 1..i + 9].try_into().expect("8 lanes"));
+            let target = i32x8::new(scratch[sn + i..sn + i + 8].try_into().expect("8 lanes"));
+            let lifted = target - ((left + right) >> 1i32);
+            scratch[sn + i..sn + i + 8].copy_from_slice(&lifted.to_array());
+            i += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while i < dn {
+        let left = scratch[i];
+        let right = scratch[(i + 1).min(sn - 1)];
+        scratch[sn + i] -= (left + right) >> 1;
+        i += 1;
+    }
+}
+
+/// `scratch[i] += (scratch[sn+i.saturating_sub(1).min(dn-1)] + scratch[sn+i.min(dn-1)] + 2) >> 2`,
+/// for `i in 0..sn`. `i == 0` is a genuine formula special case (both neighbor
+/// indices clamp to `sn+0`), handled scalar; the vector loop only covers `i in
+/// 1..dn` where both neighbor reads are unclamped and contiguous.
+#[inline]
+fn forward_update_horizontal(scratch: &mut [i32], sn: usize, dn: usize, use_wide: bool) {
+    if sn == 0 {
+        return;
+    }
+    let both = scratch[sn];
+    scratch[0] += (both + both + 2) >> 2;
+
+    let mut i = 1usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        let two = i32x8::new([2; 8]);
+        while i + 8 <= dn {
+            let left = i32x8::new(scratch[sn + i - 1..sn + i + 7].try_into().expect("8 lanes"));
+            let right = i32x8::new(scratch[sn + i..sn + i + 8].try_into().expect("8 lanes"));
+            let target = i32x8::new(scratch[i..i + 8].try_into().expect("8 lanes"));
+            let lifted = target + ((left + right + two) >> 2i32);
+            scratch[i..i + 8].copy_from_slice(&lifted.to_array());
+            i += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while i < sn {
+        let left = scratch[sn + i.saturating_sub(1).min(dn - 1)];
+        let right = scratch[sn + i.min(dn - 1)];
+        scratch[i] += (left + right + 2) >> 2;
+        i += 1;
     }
 }
 
 fn inverse_53_1d_even_in_place(coefficients: &mut [i32]) {
+    let mut scratch = vec![0i32; coefficients.len() * 3];
+    inverse_53_1d_even_with_scratch(coefficients, &mut scratch, false);
+}
+
+fn inverse_53_1d_even_with_scratch(coefficients: &mut [i32], scratch: &mut [i32], use_wide: bool) {
     let width = coefficients.len();
     if width <= 1 {
         return;
@@ -151,36 +277,638 @@ fn inverse_53_1d_even_in_place(coefficients: &mut [i32]) {
 
     let sn = width.div_ceil(2);
     let dn = width - sn;
-    let low = coefficients[..sn].to_vec();
-    let high = coefficients[sn..].to_vec();
-    let mut even = vec![0i32; sn];
-    let mut out = vec![0i32; width];
+    let low_start = 0;
+    let high_start = sn;
+    let even_start = width;
+    let out_start = width + sn;
+    let scratch = &mut scratch[..out_start + width];
+    scratch[low_start..low_start + sn].copy_from_slice(&coefficients[..sn]);
+    scratch[high_start..high_start + dn].copy_from_slice(&coefficients[sn..]);
 
     if dn == 0 {
-        coefficients.copy_from_slice(&low);
         return;
     }
 
     // Undo the reversible 5/3 update step on even samples.
-    even[0] = low[0] - ((high[0] + high[0] + 2) >> 2);
-    for i in 1..sn {
-        let right = if i < dn { high[i] } else { high[i - 1] };
-        even[i] = low[i] - ((high[i - 1] + right + 2) >> 2);
-    }
+    scratch[even_start] =
+        scratch[low_start] - ((scratch[high_start] + scratch[high_start] + 2) >> 2);
+    inverse_undo_update_horizontal(scratch, low_start, high_start, even_start, sn, dn, use_wide);
 
     // Undo the reversible 5/3 predict step on odd samples, then interleave.
     for i in 0..sn {
-        out[2 * i] = even[i];
+        scratch[out_start + 2 * i] = scratch[even_start + i];
     }
-    for i in 0..dn {
-        out[2 * i + 1] = if i + 1 < sn {
-            high[i] + ((even[i] + even[i + 1]) >> 1)
+    inverse_undo_predict_horizontal(scratch, high_start, even_start, out_start, sn, dn, use_wide);
+
+    coefficients.copy_from_slice(&scratch[out_start..out_start + width]);
+}
+
+/// `scratch[even_start+i] = scratch[low_start+i] - ((scratch[high_start+i-1] + right + 2) >> 2)`,
+/// for `i in 1..sn`, where `right = scratch[high_start+i]` if `i < dn` else
+/// `scratch[high_start+i-1]`. The vector loop covers `i in 1..dn` where `right`
+/// is unclamped; `low_start`/`high_start`/`even_start` are disjoint regions
+/// (`0..sn`, `sn..width`, `width..width+sn`), so there is no aliasing.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn inverse_undo_update_horizontal(
+    scratch: &mut [i32],
+    low_start: usize,
+    high_start: usize,
+    even_start: usize,
+    sn: usize,
+    dn: usize,
+    use_wide: bool,
+) {
+    let mut i = 1usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        let two = i32x8::new([2; 8]);
+        while i + 8 <= dn {
+            let low = i32x8::new(
+                scratch[low_start + i..low_start + i + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let high_left = i32x8::new(
+                scratch[high_start + i - 1..high_start + i + 7]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let right = i32x8::new(
+                scratch[high_start + i..high_start + i + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let result = low - ((high_left + right + two) >> 2i32);
+            scratch[even_start + i..even_start + i + 8].copy_from_slice(&result.to_array());
+            i += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while i < sn {
+        let right = if i < dn {
+            scratch[high_start + i]
         } else {
-            high[i] + even[i]
+            scratch[high_start + i - 1]
         };
+        scratch[even_start + i] =
+            scratch[low_start + i] - ((scratch[high_start + i - 1] + right + 2) >> 2);
+        i += 1;
+    }
+}
+
+/// `scratch[out_start+2*i+1] = scratch[high_start+i] + ((scratch[even_start+i] +
+/// scratch[even_start+i+1]) >> 1)`, for `i in 0..dn`, with the last element
+/// (when `i+1 >= sn`) reusing `scratch[even_start+i]` for both operands. Reads
+/// are contiguous; writes are strided (every other position), so the vector
+/// batch computes 8 lanes then scatter-stores them individually, mirroring
+/// `apply_lift_wide` in `irrev97.rs`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn inverse_undo_predict_horizontal(
+    scratch: &mut [i32],
+    high_start: usize,
+    even_start: usize,
+    out_start: usize,
+    sn: usize,
+    dn: usize,
+    use_wide: bool,
+) {
+    let mut i = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        // Interior where `i+1 < sn`, i.e. the `even_start+i+1` read is unclamped.
+        let safe_len = dn.min(sn.saturating_sub(1));
+        while i + 8 <= safe_len {
+            let high = i32x8::new(
+                scratch[high_start + i..high_start + i + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let even = i32x8::new(
+                scratch[even_start + i..even_start + i + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let even_next = i32x8::new(
+                scratch[even_start + i + 1..even_start + i + 9]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let result = high + ((even + even_next) >> 1i32);
+            let arr = result.to_array();
+            for (k, &value) in arr.iter().enumerate() {
+                scratch[out_start + 2 * (i + k) + 1] = value;
+            }
+            i += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while i < dn {
+        scratch[out_start + 2 * i + 1] = if i + 1 < sn {
+            scratch[high_start + i] + ((scratch[even_start + i] + scratch[even_start + i + 1]) >> 1)
+        } else {
+            scratch[high_start + i] + scratch[even_start + i]
+        };
+        i += 1;
+    }
+}
+
+fn forward_53_vertical_even_in_place(
+    data: &mut [i32],
+    stride: usize,
+    active_width: usize,
+    active_height: usize,
+    scratch: &mut [i32],
+    use_wide: bool,
+) {
+    if active_width == 0 || active_height <= 1 {
+        return;
     }
 
-    coefficients.copy_from_slice(&out);
+    let sn = active_height.div_ceil(2);
+    let dn = active_height - sn;
+    let scratch = &mut scratch[..active_width * active_height];
+
+    for i in 0..sn {
+        let src = (2 * i) * stride;
+        let dst = i * active_width;
+        scratch[dst..dst + active_width].copy_from_slice(&data[src..src + active_width]);
+    }
+    for i in 0..dn {
+        let src = (2 * i + 1) * stride;
+        let dst = (sn + i) * active_width;
+        scratch[dst..dst + active_width].copy_from_slice(&data[src..src + active_width]);
+    }
+
+    if active_width.saturating_mul(active_height) >= PARALLEL_COLUMN_THRESHOLD {
+        // The predict step only ever reads the low region (`0..sn*active_width`)
+        // and only ever writes the high region (`sn*active_width..`); those
+        // regions are disjoint by construction (the deinterleave above put
+        // "even" source rows in `0..sn` and "odd" source rows in `sn..`), so
+        // `split_at_mut` gives a real compiler-checked proof of no aliasing —
+        // no snapshot copy needed, unlike the interleaved-buffer cases.
+        let (low, high) = scratch.split_at_mut(sn * active_width);
+        high[..dn * active_width]
+            .par_chunks_mut(active_width)
+            .enumerate()
+            .for_each(|(i, high_row)| {
+                let left = i * active_width;
+                let right = (i + 1).min(sn - 1) * active_width;
+                predict_row_split(low, left, right, high_row, use_wide);
+            });
+    } else {
+        for i in 0..dn {
+            let left = i * active_width;
+            let right = (i + 1).min(sn - 1) * active_width;
+            let high = (sn + i) * active_width;
+            predict_row(scratch, left, right, high, active_width, use_wide);
+        }
+    }
+
+    if active_width.saturating_mul(active_height) >= PARALLEL_COLUMN_THRESHOLD {
+        // Same disjointness argument as the predict step, mirrored: update
+        // only reads the high region and only writes the low region.
+        let (low, high) = scratch.split_at_mut(sn * active_width);
+        low[..sn * active_width]
+            .par_chunks_mut(active_width)
+            .enumerate()
+            .for_each(|(i, low_row)| {
+                let left = i.saturating_sub(1).min(dn - 1) * active_width;
+                let right = i.min(dn - 1) * active_width;
+                update_row_split(high, left, right, low_row, use_wide);
+            });
+    } else {
+        for i in 0..sn {
+            let left = (sn + i.saturating_sub(1).min(dn - 1)) * active_width;
+            let right = (sn + i.min(dn - 1)) * active_width;
+            let low = i * active_width;
+            update_row(scratch, left, right, low, active_width, use_wide);
+        }
+    }
+
+    for y in 0..active_height {
+        let src = y * active_width;
+        let dst = y * stride;
+        data[dst..dst + active_width].copy_from_slice(&scratch[src..src + active_width]);
+    }
+}
+
+/// `scratch[high+x] -= (scratch[left+x] + scratch[right+x]) >> 1` over `0..width`.
+#[inline]
+fn predict_row(
+    scratch: &mut [i32],
+    left: usize,
+    right: usize,
+    high: usize,
+    width: usize,
+    use_wide: bool,
+) {
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        while x + 8 <= width {
+            let l = i32x8::new(scratch[left + x..left + x + 8].try_into().expect("8 lanes"));
+            let r = i32x8::new(
+                scratch[right + x..right + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let h = i32x8::new(scratch[high + x..high + x + 8].try_into().expect("8 lanes"));
+            let lifted = h - ((l + r) >> 1i32);
+            scratch[high + x..high + x + 8].copy_from_slice(&lifted.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        scratch[high + x] -= (scratch[left + x] + scratch[right + x]) >> 1;
+        x += 1;
+    }
+}
+
+/// `scratch[low+x] += (scratch[left+x] + scratch[right+x] + 2) >> 2` over `0..width`.
+#[inline]
+fn update_row(
+    scratch: &mut [i32],
+    left: usize,
+    right: usize,
+    low: usize,
+    width: usize,
+    use_wide: bool,
+) {
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        let two = i32x8::new([2; 8]);
+        while x + 8 <= width {
+            let l = i32x8::new(scratch[left + x..left + x + 8].try_into().expect("8 lanes"));
+            let r = i32x8::new(
+                scratch[right + x..right + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let lo = i32x8::new(scratch[low + x..low + x + 8].try_into().expect("8 lanes"));
+            let lifted = lo + ((l + r + two) >> 2i32);
+            scratch[low + x..low + x + 8].copy_from_slice(&lifted.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        scratch[low + x] += (scratch[left + x] + scratch[right + x] + 2) >> 2;
+        x += 1;
+    }
+}
+
+/// `high_row[x] -= (low[left+x] + low[right+x]) >> 1` over `0..high_row.len()`.
+/// Same arithmetic as `predict_row`, but reading `low` and writing `high_row`
+/// as separate slices (the halves of a `split_at_mut`) instead of one shared
+/// `scratch` buffer at absolute offsets.
+#[inline]
+fn predict_row_split(low: &[i32], left: usize, right: usize, high_row: &mut [i32], use_wide: bool) {
+    let width = high_row.len();
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        while x + 8 <= width {
+            let l = i32x8::new(low[left + x..left + x + 8].try_into().expect("8 lanes"));
+            let r = i32x8::new(low[right + x..right + x + 8].try_into().expect("8 lanes"));
+            let h = i32x8::new(high_row[x..x + 8].try_into().expect("8 lanes"));
+            let lifted = h - ((l + r) >> 1i32);
+            high_row[x..x + 8].copy_from_slice(&lifted.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        high_row[x] -= (low[left + x] + low[right + x]) >> 1;
+        x += 1;
+    }
+}
+
+/// `low_row[x] += (high[left+x] + high[right+x] + 2) >> 2` over `0..low_row.len()`.
+/// Same arithmetic as `update_row`, with `high`/`low_row` as separate slices.
+#[inline]
+fn update_row_split(high: &[i32], left: usize, right: usize, low_row: &mut [i32], use_wide: bool) {
+    let width = low_row.len();
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        let two = i32x8::new([2; 8]);
+        while x + 8 <= width {
+            let l = i32x8::new(high[left + x..left + x + 8].try_into().expect("8 lanes"));
+            let r = i32x8::new(high[right + x..right + x + 8].try_into().expect("8 lanes"));
+            let lo = i32x8::new(low_row[x..x + 8].try_into().expect("8 lanes"));
+            let lifted = lo + ((l + r + two) >> 2i32);
+            low_row[x..x + 8].copy_from_slice(&lifted.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        low_row[x] += (high[left + x] + high[right + x] + 2) >> 2;
+        x += 1;
+    }
+}
+
+fn inverse_53_vertical_even_in_place(
+    data: &mut [i32],
+    stride: usize,
+    active_width: usize,
+    active_height: usize,
+    scratch: &mut [i32],
+    use_wide: bool,
+) {
+    if active_width == 0 || active_height <= 1 {
+        return;
+    }
+
+    let sn = active_height.div_ceil(2);
+    let dn = active_height - sn;
+    let scratch = &mut scratch[..active_width * active_height];
+
+    if active_width.saturating_mul(active_height) >= PARALLEL_COLUMN_THRESHOLD {
+        // Reads only come from `data` (a separate, read-only buffer here),
+        // and each chunk's first row is exactly the "even" row this loop
+        // writes for a given `i` — no cross-chunk reads, so plain
+        // `par_chunks_mut` needs no snapshot.
+        scratch
+            .par_chunks_mut(2 * active_width)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                let low = i * stride;
+                let high_left = (sn + i.saturating_sub(1).min(dn - 1)) * stride;
+                let high_right = (sn + i.min(dn - 1)) * stride;
+                inverse_predict_row_into(
+                    data,
+                    low,
+                    high_left,
+                    high_right,
+                    &mut chunk[..active_width],
+                    use_wide,
+                );
+            });
+    } else {
+        for i in 0..sn {
+            let low = i * stride;
+            let high_left = (sn + i.saturating_sub(1).min(dn - 1)) * stride;
+            let high_right = (sn + i.min(dn - 1)) * stride;
+            let even = (2 * i) * active_width;
+            inverse_predict_row(
+                data,
+                scratch,
+                low,
+                high_left,
+                high_right,
+                even,
+                active_width,
+                use_wide,
+            );
+        }
+    }
+
+    if active_width.saturating_mul(active_height) >= PARALLEL_COLUMN_THRESHOLD {
+        inverse_update_rows_parallel(data, stride, scratch, sn, dn, active_width, use_wide);
+    } else {
+        for i in 0..dn {
+            let high = (sn + i) * stride;
+            let even = (2 * i) * active_width;
+            let odd = (2 * i + 1) * active_width;
+            let right_even = if i + 1 < sn {
+                (2 * (i + 1)) * active_width
+            } else {
+                even
+            };
+            inverse_update_row(
+                data,
+                scratch,
+                high,
+                even,
+                right_even,
+                odd,
+                active_width,
+                use_wide,
+            );
+        }
+    }
+
+    for y in 0..active_height {
+        let src = y * active_width;
+        let dst = y * stride;
+        data[dst..dst + active_width].copy_from_slice(&scratch[src..src + active_width]);
+    }
+}
+
+/// `right_even` can land in the *next* row-pair (`i+1 < sn`), which a
+/// `par_chunks_mut`-based split can't read across without a copy. An earlier
+/// version copied `scratch` into a snapshot `Vec` for the reads; that was
+/// correct but measured as a net regression on real images (`lear.png`,
+/// interleaved A/B verified) — the extra memcpy plus rayon's per-row
+/// overhead cost more than the parallel lift saved. This is zero-copy
+/// instead: even rows (`2*i`) are only ever read here (the previous loop,
+/// `inverse_predict_row`/`_into`, finished writing them before this runs),
+/// and odd rows (`2*i+1`) are only ever written here, each by exactly one
+/// `i` — so no two rows accessed in this loop ever alias, and raw pointers
+/// into `scratch` can safely stand in for a borrow-checked split.
+#[allow(clippy::too_many_arguments)]
+fn inverse_update_rows_parallel(
+    data: &[i32],
+    stride: usize,
+    scratch: &mut [i32],
+    sn: usize,
+    dn: usize,
+    active_width: usize,
+    use_wide: bool,
+) {
+    debug_assert!(active_width * (sn + dn) <= scratch.len());
+    let base = scratch.as_mut_ptr() as usize;
+    (0..dn).into_par_iter().for_each(|i| {
+        let high = (sn + i) * stride;
+        let even = (2 * i) * active_width;
+        let right_even = if i + 1 < sn {
+            (2 * (i + 1)) * active_width
+        } else {
+            even
+        };
+        let odd = (2 * i + 1) * active_width;
+        let ptr = base as *mut i32;
+        // SAFETY: see the function-level doc comment above.
+        let snapshot = unsafe { std::slice::from_raw_parts(ptr, active_width * (sn + dn)) };
+        let odd_row = unsafe { std::slice::from_raw_parts_mut(ptr.add(odd), active_width) };
+        inverse_update_row_into(data, snapshot, high, even, right_even, odd_row, use_wide);
+    });
+}
+
+/// `scratch[even+x] = data[low+x] - ((data[high_left+x] + data[high_right+x] + 2) >> 2)`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn inverse_predict_row(
+    data: &[i32],
+    scratch: &mut [i32],
+    low: usize,
+    high_left: usize,
+    high_right: usize,
+    even: usize,
+    width: usize,
+    use_wide: bool,
+) {
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        let two = i32x8::new([2; 8]);
+        while x + 8 <= width {
+            let lo = i32x8::new(data[low + x..low + x + 8].try_into().expect("8 lanes"));
+            let hl = i32x8::new(
+                data[high_left + x..high_left + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let hr = i32x8::new(
+                data[high_right + x..high_right + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let result = lo - ((hl + hr + two) >> 2i32);
+            scratch[even + x..even + x + 8].copy_from_slice(&result.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        scratch[even + x] = data[low + x] - ((data[high_left + x] + data[high_right + x] + 2) >> 2);
+        x += 1;
+    }
+}
+
+/// `scratch[odd+x] = data[high+x] + ((scratch[even+x] + scratch[right_even+x]) >> 1)`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn inverse_update_row(
+    data: &[i32],
+    scratch: &mut [i32],
+    high: usize,
+    even: usize,
+    right_even: usize,
+    odd: usize,
+    width: usize,
+    use_wide: bool,
+) {
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        while x + 8 <= width {
+            let h = i32x8::new(data[high + x..high + x + 8].try_into().expect("8 lanes"));
+            let e = i32x8::new(scratch[even + x..even + x + 8].try_into().expect("8 lanes"));
+            let re = i32x8::new(
+                scratch[right_even + x..right_even + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let result = h + ((e + re) >> 1i32);
+            scratch[odd + x..odd + x + 8].copy_from_slice(&result.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        scratch[odd + x] = data[high + x] + ((scratch[even + x] + scratch[right_even + x]) >> 1);
+        x += 1;
+    }
+}
+
+/// `even_row[x] = data[low+x] - ((data[high_left+x] + data[high_right+x] + 2) >> 2)`.
+/// Same arithmetic as `inverse_predict_row`, writing to `even_row` (relative
+/// indices) instead of `scratch[even+x]` (absolute).
+#[inline]
+fn inverse_predict_row_into(
+    data: &[i32],
+    low: usize,
+    high_left: usize,
+    high_right: usize,
+    even_row: &mut [i32],
+    use_wide: bool,
+) {
+    let width = even_row.len();
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        let two = i32x8::new([2; 8]);
+        while x + 8 <= width {
+            let lo = i32x8::new(data[low + x..low + x + 8].try_into().expect("8 lanes"));
+            let hl = i32x8::new(
+                data[high_left + x..high_left + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let hr = i32x8::new(
+                data[high_right + x..high_right + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let result = lo - ((hl + hr + two) >> 2i32);
+            even_row[x..x + 8].copy_from_slice(&result.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        even_row[x] = data[low + x] - ((data[high_left + x] + data[high_right + x] + 2) >> 2);
+        x += 1;
+    }
+}
+
+/// `odd_row[x] = data[high+x] + ((snapshot[even+x] + snapshot[right_even+x]) >> 1)`.
+/// Same arithmetic as `inverse_update_row`, reading the (already-finalized)
+/// even rows from an immutable `snapshot` and writing to `odd_row` (relative
+/// indices) instead of `scratch[odd+x]` (absolute).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn inverse_update_row_into(
+    data: &[i32],
+    snapshot: &[i32],
+    high: usize,
+    even: usize,
+    right_even: usize,
+    odd_row: &mut [i32],
+    use_wide: bool,
+) {
+    let width = odd_row.len();
+    let mut x = 0usize;
+    #[cfg(feature = "simd")]
+    if use_wide {
+        while x + 8 <= width {
+            let h = i32x8::new(data[high + x..high + x + 8].try_into().expect("8 lanes"));
+            let e = i32x8::new(
+                snapshot[even + x..even + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let re = i32x8::new(
+                snapshot[right_even + x..right_even + x + 8]
+                    .try_into()
+                    .expect("8 lanes"),
+            );
+            let result = h + ((e + re) >> 1i32);
+            odd_row[x..x + 8].copy_from_slice(&result.to_array());
+            x += 8;
+        }
+    }
+    #[cfg(not(feature = "simd"))]
+    let _ = use_wide;
+    while x < width {
+        odd_row[x] = data[high + x] + ((snapshot[even + x] + snapshot[right_even + x]) >> 1);
+        x += 1;
+    }
 }
 
 fn encode_resolutions(width: usize, height: usize, levels: u8) -> Vec<(usize, usize)> {
@@ -227,6 +955,120 @@ mod tests {
         assert_eq!(data, vec![10, 33, 0, 10]);
     }
 
+    /// Direct correctness checks for the parallel-path helpers, bypassing
+    /// `PARALLEL_COLUMN_THRESHOLD` entirely (it's disabled by default — see
+    /// the constant's doc comment — so nothing else exercises these paths).
+    fn check_forward_split_matches_sequential(use_wide: bool) {
+        let width = 40usize;
+        let sn = 5usize;
+        let dn = 5usize;
+        let total = (sn + dn) * width;
+        let original: Vec<i32> = (0..total).map(|i| ((i as i32 * 37) % 511) - 255).collect();
+
+        let mut seq = original.clone();
+        for i in 0..dn {
+            let left = i * width;
+            let right = (i + 1).min(sn - 1) * width;
+            let high = (sn + i) * width;
+            super::predict_row(&mut seq, left, right, high, width, use_wide);
+        }
+        for i in 0..sn {
+            let left = (sn + i.saturating_sub(1).min(dn - 1)) * width;
+            let right = (sn + i.min(dn - 1)) * width;
+            let low = i * width;
+            super::update_row(&mut seq, left, right, low, width, use_wide);
+        }
+
+        let mut par = original.clone();
+        {
+            let (low, high) = par.split_at_mut(sn * width);
+            for i in 0..dn {
+                let left = i * width;
+                let right = (i + 1).min(sn - 1) * width;
+                super::predict_row_split(
+                    low,
+                    left,
+                    right,
+                    &mut high[i * width..(i + 1) * width],
+                    use_wide,
+                );
+            }
+        }
+        {
+            let (low, high) = par.split_at_mut(sn * width);
+            for i in 0..sn {
+                let left = i.saturating_sub(1).min(dn - 1) * width;
+                let right = i.min(dn - 1) * width;
+                super::update_row_split(
+                    high,
+                    left,
+                    right,
+                    &mut low[i * width..(i + 1) * width],
+                    use_wide,
+                );
+            }
+        }
+
+        assert_eq!(seq, par, "use_wide={use_wide}");
+    }
+
+    #[test]
+    fn forward_split_matches_sequential_scalar() {
+        check_forward_split_matches_sequential(false);
+    }
+
+    #[test]
+    #[cfg(feature = "simd")]
+    fn forward_split_matches_sequential_wide() {
+        check_forward_split_matches_sequential(true);
+    }
+
+    fn check_inverse_update_rows_parallel_matches_sequential(use_wide: bool) {
+        let width = 40usize;
+        // sn = dn + 1, to exercise the `right_even` clamp-to-`even` boundary case.
+        let sn = 6usize;
+        let dn = 5usize;
+        let stride = width;
+        let scratch_len = width * (sn + dn);
+        let data: Vec<i32> = (0..(sn + dn) * stride)
+            .map(|i| ((i as i32 * 53) % 401) - 200)
+            .collect();
+        let original_scratch: Vec<i32> = (0..scratch_len)
+            .map(|i| ((i as i32 * 37) % 511) - 255)
+            .collect();
+
+        let mut seq = original_scratch.clone();
+        for i in 0..dn {
+            let high = (sn + i) * stride;
+            let even = (2 * i) * width;
+            let odd = (2 * i + 1) * width;
+            let right_even = if i + 1 < sn {
+                (2 * (i + 1)) * width
+            } else {
+                even
+            };
+            super::inverse_update_row(
+                &data, &mut seq, high, even, right_even, odd, width, use_wide,
+            );
+        }
+
+        let mut par = original_scratch.clone();
+        super::inverse_update_rows_parallel(&data, stride, &mut par, sn, dn, width, use_wide);
+
+        assert_eq!(seq, par, "use_wide={use_wide}");
+    }
+
+    #[test]
+    fn inverse_update_rows_parallel_matches_sequential_scalar() {
+        check_inverse_update_rows_parallel_matches_sequential(false);
+    }
+
+    #[test]
+    #[cfg(feature = "simd")]
+    fn inverse_update_rows_parallel_matches_sequential_wide() {
+        check_inverse_update_rows_parallel_matches_sequential(true);
+    }
+
     #[test]
     fn multi_level_transform_preserves_length_and_runs_on_odd_sizes() {
         let mut data = (0..35).collect::<Vec<_>>();
@@ -255,11 +1097,7 @@ mod tests {
     #[test]
     fn forward_then_inverse_53_roundtrips_exactly_at_5_levels_non_pow2() {
         // These are the actual sizes used by the encoder for RGB lossless test images.
-        let cases: &[(usize, usize, u8)] = &[
-            (48, 40, 5),
-            (64, 48, 5),
-            (32, 32, 5),
-        ];
+        let cases: &[(usize, usize, u8)] = &[(48, 40, 5), (64, 48, 5), (32, 32, 5)];
         for &(width, height, levels) in cases {
             for (name, original) in tiny_patterns(width, height) {
                 let mut data = original.clone();

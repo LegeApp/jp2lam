@@ -37,6 +37,7 @@ pub fn print_timing_data() {
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         let total: std::time::Duration = sorted.iter().map(|t| t.1).sum();
         println!("\n=== Profile Timing ({} entries) ===", sorted.len());
+        println!("  primitives: {}", crate::simd::active_backend());
         for (name, dur) in sorted.iter().take(20) {
             let pct = 100.0 * dur.as_secs_f64() / total.as_secs_f64();
             println!("  {:>6.2}% {:12.3}ms  {}", pct, dur.as_secs_f64() * 1000.0, name);
